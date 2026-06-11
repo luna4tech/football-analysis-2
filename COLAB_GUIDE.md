@@ -92,15 +92,29 @@ print("Input videos available:")
 > `/content/football-analysis-2` from Drive instead of cloning.)
 
 ### 3. Install dependencies
-Colab already has `torch`/`torchvision`. Install the rest of the runtime deps for both stages:
+Colab already has `torch`/`torchvision`. Install GtaLink's `requirements.txt` (it's the
+comprehensive set that covers Stage 2's refine libraries **and** the import-time deps of the
+bundled torchreid that Stage 1's ReID needs), then add the two libraries it doesn't list —
+`cython_bbox` (the tracker's IoU) and `tqdm`:
 
 ```python
-!pip install -q opencv-python loguru lap scikit-learn scipy matplotlib seaborn tqdm thop tabulate Pillow cython pycocotools ninja
+%cd $REPO
+!pip install -q -r gta-link/requirements.txt
+!pip install -q cython_bbox tqdm
 ```
 
-> The `yolox` and `reid` packages are used **in place** (each stage runs from its own directory),
-> so there is nothing to `pip install` or compile for them — these runtime libraries are enough
-> for inference.
+> **You do NOT need to run the READMEs' build steps.** The `yolox` and `reid` packages are used
+> **in place** (each stage runs from its own directory), so:
+> - Deep-EIoU's `python setup.py develop` is skipped — it only compiles `yolox._C`, which is used
+>   solely by the COCO mAP evaluator, not by detection/tracking (NMS uses torchvision).
+> - `reid/setup.py develop` is skipped — it only builds an optional Cython ranking metric that has
+>   a Python fallback; `FeatureExtractor` doesn't use it.
+> - GtaLink's separate `pip install torchreid` is skipped — Stage 2 reuses Stage 1's embeddings and
+>   never imports torchreid.
+>
+> `requirements.txt` also pulls a few training/dev-only packages (`tb-nightly`, `flake8`, `yapf`)
+> the pipeline doesn't use — harmless, just slower to install. If `pip install cython_bbox` ever
+> fails to build, run `!pip install -q cython` first and retry.
 
 ### 4. Fetch the checkpoints (once, to Drive) and link them into place
 Downloads the two model files from the public Drive folder into your Drive `checkpoints/` folder
