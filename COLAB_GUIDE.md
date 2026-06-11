@@ -27,13 +27,11 @@ You also need two model checkpoints (they are **not** in the repo — they are g
 | `best_ckpt.pth.tar` | YOLOX detector (Stage 1) | `Deep-EIoU/Deep-EIoU/checkpoints/best_ckpt.pth.tar` |
 | `sports_model.pth.tar-60` | OSNet ReID (Stage 1) | `Deep-EIoU/Deep-EIoU/checkpoints/sports_model.pth.tar-60` |
 
-Download them from the original Deep-EIoU / GtaLink release pages (see those projects' READMEs),
-then upload both into a Drive folder you control, e.g.:
+Both live in the public Google Drive folder linked from the Deep-EIoU readme:
+**<https://drive.google.com/drive/folders/1wItcb0yeGaxOS08_G9yRWBTnpVf0vZ2w>**
 
-```
-Colab Notebook/football-analysis-project/checkpoints/best_ckpt.pth.tar
-Colab Notebook/football-analysis-project/checkpoints/sports_model.pth.tar-60
-```
+You don't need to download them by hand — **Step 4 below fetches them with `gdown`** into your
+Drive `checkpoints/` folder (once) and links them into place. Nothing to do here.
 
 > **Folder name note:** Drive's auto-created folder is usually **`Colab Notebooks`** (plural).
 > You wrote `Colab Notebook` (singular). Use whichever actually exists in your Drive and keep it
@@ -104,14 +102,41 @@ Colab already has `torch`/`torchvision`. Install the rest of the runtime deps fo
 > so there is nothing to `pip install` or compile for them — these runtime libraries are enough
 > for inference.
 
-### 4. Link the checkpoints into the location Stage 1 expects
+### 4. Fetch the checkpoints (once, to Drive) and link them into place
+Downloads the two model files from the public Drive folder into your Drive `checkpoints/` folder
+the first time, then reuses them on later sessions. Finally it symlinks them into the directory
+Stage 1 expects.
 
 ```python
-!mkdir -p "$REPO/Deep-EIoU/Deep-EIoU/checkpoints"
-!ln -sf "$CKPT_DIR/best_ckpt.pth.tar"        "$REPO/Deep-EIoU/Deep-EIoU/checkpoints/best_ckpt.pth.tar"
-!ln -sf "$CKPT_DIR/sports_model.pth.tar-60"  "$REPO/Deep-EIoU/Deep-EIoU/checkpoints/sports_model.pth.tar-60"
-!ls -la "$REPO/Deep-EIoU/Deep-EIoU/checkpoints"
+import glob, os
+
+os.makedirs(CKPT_DIR, exist_ok=True)
+CKPT_FOLDER_URL = "https://drive.google.com/drive/folders/1wItcb0yeGaxOS08_G9yRWBTnpVf0vZ2w"
+
+# Download only if not already in Drive (the files are large — avoid re-downloading each session).
+have = {os.path.basename(p) for p in glob.glob(f"{CKPT_DIR}/**/*", recursive=True)}
+if not {"best_ckpt.pth.tar", "sports_model.pth.tar-60"} <= have:
+    !pip install -q gdown
+    !gdown --folder "{CKPT_FOLDER_URL}" -O "$CKPT_DIR"
+
+# Link each checkpoint into Deep-EIoU/Deep-EIoU/checkpoints/ (robust to any sub-folder gdown made).
+dst_dir = f"{REPO}/Deep-EIoU/Deep-EIoU/checkpoints"
+os.makedirs(dst_dir, exist_ok=True)
+for name in ("best_ckpt.pth.tar", "sports_model.pth.tar-60"):
+    matches = glob.glob(f"{CKPT_DIR}/**/{name}", recursive=True)
+    assert matches, f"{name} not found under {CKPT_DIR} — check the gdown download"
+    dst = f"{dst_dir}/{name}"
+    if os.path.islink(dst) or os.path.exists(dst):
+        os.remove(dst)
+    os.symlink(matches[0], dst)
+    print("linked", matches[0], "->", dst)
+
+!ls -la "{dst_dir}"
 ```
+
+> If `gdown --folder` ever fails (Drive quota / auth), open the folder link in a browser, download
+> the two files manually, and drop them into your Drive `checkpoints/` folder — then re-run this
+> cell (it will skip the download and just link them).
 
 ### 5. Run the full pipeline → outputs straight to Drive
 
