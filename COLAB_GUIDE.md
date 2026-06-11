@@ -4,8 +4,8 @@ Step-by-step instructions to run the two-stage pipeline (DeepEIoU tracking → G
 refinement) on a Colab GPU, reading input videos from Google Drive and persisting all outputs
 back to Drive.
 
-- **Input videos:** `Colab Notebook/football-analysis-project/input-videos/`
-- **Outputs:** `Colab Notebook/football-analysis-project/output/gta-track/`
+- **Input videos:** `Colab Notebooks/football-analysis-project/input-videos/`
+- **Outputs:** `Colab Notebooks/football-analysis-project/output/gta-track/`
 
 > For the meaning of each stage, flag, and artifact, see [USER_GUIDE.md](USER_GUIDE.md). This
 > document is only about *running it on Colab*.
@@ -33,10 +33,6 @@ Both live in the public Google Drive folder linked from the Deep-EIoU readme:
 You don't need to download them by hand — **Step 4 below fetches them with `gdown`** into your
 Drive `checkpoints/` folder (once) and links them into place. Nothing to do here.
 
-> **Folder name note:** Drive's auto-created folder is usually **`Colab Notebooks`** (plural).
-> You wrote `Colab Notebook` (singular). Use whichever actually exists in your Drive and keep it
-> consistent in the `DRIVE_BASE` variable below.
-
 ---
 
 ## Colab notebook — paste each block into its own cell
@@ -57,8 +53,8 @@ drive.mount('/content/drive')
 import os
 from pathlib import Path
 
-# --- EDIT THIS if your Drive folder is "Colab Notebooks" (plural) ---
-DRIVE_BASE = "/content/drive/MyDrive/Colab Notebook/football-analysis-project"
+# EDIT this if your project folder lives elsewhere in Drive:
+DRIVE_BASE = "/content/drive/MyDrive/Colab Notebooks/football-analysis-project"
 
 INPUT_DIR   = f"{DRIVE_BASE}/input-videos"
 OUTPUT_DIR  = f"{DRIVE_BASE}/output/gta-track"
@@ -248,7 +244,7 @@ floating-point noise):
 
 ## Output layout on Drive
 
-After a run, `Colab Notebook/football-analysis-project/output/gta-track/<STEM>/` contains:
+After a run, `Colab Notebooks/football-analysis-project/output/gta-track/<STEM>/` contains:
 
 ```
 <STEM>/
@@ -279,7 +275,7 @@ After a run, `Colab Notebook/football-analysis-project/output/gta-track/<STEM>/`
   end: `!cp -r "/content/work/$STEM" "$OUTPUT_DIR/"`.
 - **Re-tuning a parameter seems ignored**: that's the cache — add the matching `--force-*` flag
   (see Step 5).
-- **Path with a space** (`Colab Notebook`): always keep the `"$VAR"` quotes in the `!` cells.
+- **Path with a space** (`Colab Notebooks`): always keep the `"$VAR"` quotes in the `!` cells.
 - **Wrong/blank detections**: ensure the detector `best_ckpt.pth.tar` matches the YOLOX exp
   (`yolox/yolox_x_ch_sportsmot.py`, the Stage 1 default).
 - **Running stages independently** (e.g. only refine, from a cached `tracklets.pkl`) is documented
