@@ -25,7 +25,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
@@ -160,3 +160,150 @@ class TrackletAssembler:
     def n_unique_tracks(self) -> int:
         """Number of distinct track ids accumulated so far."""
         return len(self.tracklets)
+
+
+# ---------------------------------------------------------------------------
+# Batched-ReID split (pure; used by the Task-3 parallel path)
+# ---------------------------------------------------------------------------
+def split_by_counts(
+    embs: "np.ndarray | None",
+    counts: Sequence["int | None"],
+) -> List["np.ndarray | None"]:
+    """Split a stacked ReID embedding block back into per-frame embeddings.
+
+    The parallel path batches every crop across the frames of one batch into a
+    single extractor call, producing one ``(total_crops, D)`` array.  This
+    function splits that block back into one entry per frame, in order, so the
+    consumer receives the same ``embs`` it would have under sequential
+    per-frame ReID.
+
+    Parameters
+    ----------
+    embs:
+        The stacked ``(total_crops, D)`` embeddings for the whole batch (the
+        concatenation of every frame's crops in frame order), or ``None`` when
+        the batch contributed no crops at all (``total_crops == 0``).
+    counts:
+        One entry per frame, in frame order:
+
+        * a non-negative ``int`` — the number of crops that frame contributed
+          (``0`` is allowed: a frame whose detector fired but every box was
+          dropped by clamp/zero-area filtering), or
+        * ``None`` — the frame's detection output was ``None`` (detector
+          produced nothing); it is a pass-through and stays ``None`` so the
+          consumer applies the exact sequential skip rule.
+
+    Returns
+    -------
+    list
+        One element per entry in *counts*, in the same order:
+
+        * ``None`` where ``counts[i] is None`` (``None`` passthrough),
+        * a ``(0, D)`` empty array where ``counts[i] == 0``,
+        * the matching ``(counts[i], D)`` slice of *embs* otherwise.
+
+    Notes
+    -----
+    Total rows are conserved: ``sum(c for c in counts if c) == embs.shape[0]``
+    (when *embs* is not ``None``).  A ``ValueError`` is raised if the integer
+    counts do not sum to ``embs.shape[0]`` so a producer bug surfaces loudly
+    rather than silently misaligning embeddings with detections.
+    """
+    int_counts = [c for c in counts if c is not None]
+    total = sum(int_counts)
+
+    if embs is None:
+        if total != 0:
+            raise ValueError(
+                f"embs is None but counts sum to {total} (expected 0)"
+            )
+        # Infer the embedding width only matters for non-empty frames; with no
+        # crops at all every int-count is 0, so a 0-wide empty array is fine.
+        dim = 0
+        out: List["np.ndarray | None"] = []
+        for c in counts:
+            if c is None:
+                out.append(None)
+            else:
+                out.append(np.empty((0, dim), dtype=np.float32))
+        return out
+
+    embs = np.asarray(embs)
+    if embs.shape[0] != total:
+        raise ValueError(
+            f"embs has {embs.shape[0]} rows but counts sum to {total}"
+        )
+    dim = embs.shape[1] if embs.ndim == 2 else 0
+
+    out = []
+    offset = 0
+    for c in counts:
+        if c is None:
+            out.append(None)
+            continue
+        out.append(embs[offset : offset + c])
+        offset += c
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Strict-order batch/consume loop (pure; the ordering core of the parallel path)
+# ---------------------------------------------------------------------------
+def batched_consume_loop(
+    frame_source: Iterable[Tuple[int, Any]],
+    batch_size: int,
+    perceive_batch_fn: Callable[[List[Any]], Sequence[Tuple[Any, Any]]],
+    consume_fn: Callable[[int, Any, Any], None],
+) -> int:
+    """Form batches from *frame_source* and drive the consumer in strict order.
+
+    This is the ordering core of the Task-3 parallel path.  It is pure Python
+    (no torch / cv2 / yolox) and accepts INJECTED ``perceive_batch_fn`` and
+    ``consume_fn`` callables so it can be exercised on a CPU-only machine with
+    stubs.
+
+    Contract / invariants
+    ---------------------
+    * ``frame_source`` yields ``(frame_id, frame)`` in strict ascending
+      ``frame_id`` order with no gaps (the prefetch thread guarantees this).
+    * Frames are gathered into batches of up to ``batch_size``; the final
+      partial batch is handled.
+    * ``perceive_batch_fn(frames)`` returns a sequence of ``(det, embs)``
+      aligned one-to-one with the frames it was given.
+    * ``consume_fn(frame_id, det, embs)`` is called for EVERY frame, exactly
+      once, in ascending ``frame_id`` order — ``0, 1, 2, ..., N-1`` with no
+      reordering and no gaps.  The ``frame_id`` passed is always the loop index
+      (decode order), never any tracker-internal counter.  When a frame's
+      ``det`` is ``None``, ``consume_fn`` is still called (it applies the
+      sequential skip rule itself: it must NOT advance the tracker and must emit
+      no row), so the loop index keeps advancing identically to the sequential
+      path.
+
+    Returns
+    -------
+    int
+        The number of frames processed (``N``).
+    """
+    n_frames = 0
+    batch_ids: List[int] = []
+    batch_frames: List[Any] = []
+
+    def _flush() -> None:
+        results = perceive_batch_fn(batch_frames)
+        for fid, (det, embs) in zip(batch_ids, results):
+            consume_fn(fid, det, embs)
+        batch_ids.clear()
+        batch_frames.clear()
+
+    for frame_id, frame in frame_source:
+        batch_ids.append(frame_id)
+        batch_frames.append(frame)
+        n_frames += 1
+        if len(batch_frames) == batch_size:
+            _flush()
+
+    # Final partial batch.
+    if batch_frames:
+        _flush()
+
+    return n_frames
