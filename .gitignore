@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Pipeline + tracker outputs (generated, reproducible)
+artifacts/
+YOLOX_outputs/
+
+# Model weights / checkpoints (large binaries, fetched separately)
+*.pth
+*.pt
+*.pth.tar
+*.pth.tar-*
+*.onnx
+*.engine
+*.trt
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Claude Code local-only settings (keep skills tracked, ignore machine-local prefs)
+.claude/settings.local.json
