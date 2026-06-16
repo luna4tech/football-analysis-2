@@ -89,11 +89,37 @@ class LayoutPaths:
 # ---------------------------------------------------------------------------
 
 
-def _format_mot_line(row: "np.ndarray | list") -> str:
-    """Format one ``(>=10)`` row to a MOTChallenge CSV line.
+def _format_gt_line(row: "np.ndarray | list") -> str:
+    """Format one canonical GT row to a MOTChallenge ``gt.txt`` CSV line.
 
-    Output columns: ``frame,id,x,y,w,h,conf,-1,-1,-1``. ``frame`` and ``id`` are
-    written as integers; the box and ``conf`` keep their (float) precision.
+    Output columns (the order TrackEval's MotChallenge2DBox reads):
+    ``frame,id,x,y,w,h,conf,class,visibility``. ``class`` is taken from canonical
+    column index 7 and ``visibility`` from index 8 — NOT hardcoded to ``-1``.
+    The GT loader already coerces the data's ``-1`` to ``1`` for these columns,
+    so a sample GT row lands here as ``class=1, visibility=1``; writing the real
+    values is what lets TrackEval's pedestrian eval (class id 1) keep the GT.
+
+    ``frame`` and ``id`` are written as integers; the box, ``conf``, and
+    ``visibility`` keep their (float) precision. ``class`` is written as an
+    integer (TrackEval matches class ids).
+    """
+    frame = int(round(float(row[0])))
+    tid = int(round(float(row[1])))
+    x, y, w, h = (float(v) for v in row[2:6])
+    conf = float(row[6])
+    cls = int(round(float(row[7])))
+    vis = float(row[8])
+    return f"{frame},{tid},{x:g},{y:g},{w:g},{h:g},{conf:g},{cls},{vis:g}"
+
+
+def _format_pred_line(row: "np.ndarray | list") -> str:
+    """Format one prediction row to a MOTChallenge tracker-file CSV line.
+
+    Output columns: ``frame,id,x,y,w,h,conf,-1,-1,-1``. TrackEval's tracker
+    reader uses only indices 0-6 (``frame,id,bbox,conf``=score) and ignores
+    class/visibility, so the trailing ``-1,-1,-1`` are left as inert
+    placeholders. ``frame`` and ``id`` are written as integers; the box and
+    ``conf`` keep their (float) precision.
     """
     frame = int(round(float(row[0])))
     tid = int(round(float(row[1])))
@@ -180,13 +206,13 @@ def materialize_layout(
     paths.seqmaps_dir.mkdir(parents=True, exist_ok=True)
     paths.tracker_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- GT gt.txt (AS-IS, 1-based) ---
+    # --- GT gt.txt (AS-IS, 1-based; real class@7 + visibility@8) ---
     gt_rows = _gt_to_motchallenge_rows(gt)
-    _write_mot_file(paths.gt_txt, gt_rows)
+    _write_mot_file(paths.gt_txt, gt_rows, _format_gt_line)
 
     # --- Pred data/<seq>.txt (centralized 0->1 conversion, conf=score) ---
     pred_rows = _pred_to_motchallenge_rows(pred)
-    _write_mot_file(paths.tracker_txt, pred_rows)
+    _write_mot_file(paths.tracker_txt, pred_rows, _format_pred_line)
 
     # --- seqinfo.ini (seqLength = max 1-based frame across GT and conv. pred) ---
     seq_length = _seq_length(gt_rows, pred_rows)
@@ -205,10 +231,15 @@ def materialize_layout(
     return paths
 
 
-def _write_mot_file(path: Path, rows: np.ndarray) -> None:
-    """Write *rows* as MOTChallenge CSV lines (one per row) to *path*."""
+def _write_mot_file(path: Path, rows: np.ndarray, formatter) -> None:
+    """Write *rows* as MOTChallenge CSV lines (one per row) to *path*.
+
+    *formatter* is the per-row line formatter — :func:`_format_gt_line` for the
+    GT ``gt.txt`` (real class/visibility) or :func:`_format_pred_line` for the
+    tracker file (inert ``-1,-1,-1`` trailing columns).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [_format_mot_line(r) for r in rows]
+    lines = [formatter(r) for r in rows]
     # Trailing newline; empty file (no rows) is still valid.
     text = "\n".join(lines)
     if lines:

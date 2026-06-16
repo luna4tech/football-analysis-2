@@ -273,6 +273,84 @@ def test_materialize_pred_columns_and_conf():
         assert cols[7:] == ["-1", "-1", "-1"]
 
 
+# GT exactly as the real test-data is shipped: conf=1 but class=-1, vis=-1 on
+# every row (1-based frames). The loader coerces class/vis -1 -> 1.
+_SAMPLE_GT_RAW_MINUS1 = (
+    "1,21,427.0,529.0,17.0,51.0,1,-1,-1,-1\n"
+    "1,22,1149.0,388.0,10.0,34.0,1,-1,-1,-1\n"
+    "2,21,430.0,531.0,17.0,51.0,1,-1,-1,-1\n"
+    "3,22,1152.0,390.0,10.0,34.0,1,-1,-1,-1\n"
+)
+
+
+def _read_mot_rows(path: Path) -> list[list[str]]:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rows.append(line.split(","))
+    return rows
+
+
+def test_materialize_gt_class_and_visibility_are_one():
+    """E3: GT source rows with class=-1/vis=-1 must be written as class=1/vis=1.
+
+    Real test-data ships class=-1 and visibility=-1 on every GT row. The loader
+    coerces those to 1; the writer must carry the canonical class@7/vis@8 instead
+    of the old hardcoded -1 (which made TrackEval's pedestrian eval find ZERO
+    valid GT and report ~0 for every metric).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # load_gt(motchallenge) semantics: parse the raw file (class/vis -1 -> 1).
+        gt = load_gt(_write(Path(tmp) / "gt.txt", _SAMPLE_GT_RAW_MINUS1))
+        # In-memory canonical GT already has class=1, vis=1.
+        assert all(gt.rows[:, 7] == 1.0), "loader should coerce class -1 -> 1"
+        assert all(gt.rows[:, 8] == 1.0), "loader should coerce visibility -1 -> 1"
+
+        pred = load_pred(_write(Path(tmp) / "refined.txt", _SAMPLE_PRED))
+        layout = materialize_layout(Path(tmp) / "work", "M59", gt, pred)
+
+        # Read back the WRITTEN gt.txt and assert EVERY row's class/vis == 1.
+        gt_written = _read_mot_rows(layout.gt_txt)
+        assert len(gt_written) == 4, f"expected 4 GT rows, got {len(gt_written)}"
+        for i, cols in enumerate(gt_written):
+            assert len(cols) == 9, f"GT line {i} must have 9 cols: {cols}"
+            assert int(cols[7]) == 1, f"GT row {i} class must be 1, got {cols[7]!r}"
+            assert float(cols[8]) == 1.0, (
+                f"GT row {i} visibility must be 1, got {cols[8]!r}"
+            )
+        # First GT row's frame/id/box/conf preserved (sanity of the rest).
+        first = gt_written[0]
+        assert first[0] == "1" and first[1] == "21"
+        assert first[2:6] == ["427", "529", "17", "51"]
+        assert abs(float(first[6]) - 1.0) < 1e-9
+
+
+def test_materialize_pred_indices_0_to_6_intact():
+    """E3: the tracker file's TrackEval-read columns 0-6 stay valid.
+
+    TrackEval's tracker reader uses frame,id,bbox,conf at indices 0-6. The GT fix
+    must not regress those: frame is +1 shifted (0-based -> 1-based) and conf is
+    the pred score.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = load_gt(_write(Path(tmp) / "gt.txt", _SAMPLE_GT_RAW_MINUS1))
+        pred = load_pred(_write(Path(tmp) / "refined.txt", _SAMPLE_PRED))
+        layout = materialize_layout(Path(tmp) / "work", "M59", gt, pred)
+
+        pred_written = _read_mot_rows(layout.tracker_txt)
+        # _SAMPLE_PRED rows are 0-based {0,0,1,2} -> 1-based {1,1,2,3}.
+        assert [int(r[0]) for r in pred_written] == [1, 1, 2, 3], "frame must be +1"
+        first = pred_written[0]
+        # id, box, conf=score at indices 1-6 unchanged.
+        assert first[1] == "1"
+        assert first[2:6] == ["100", "200", "50", "80"]
+        assert abs(float(first[6]) - 0.91) < 1e-9, "conf must equal pred score"
+        # Indices 0-6 are exactly 7 fields; the line itself keeps 10 columns.
+        assert len(first) == 10, f"pred line must have 10 cols: {first}"
+
+
 def test_materialize_seqlength_is_max_one_based_frame():
     with tempfile.TemporaryDirectory() as tmp:
         gt = load_gt(_write(Path(tmp) / "gt.txt", _SAMPLE_GT))
@@ -702,6 +780,8 @@ _TESTS = [
     ("gt seam: gt_loader decorator routes", test_gt_loader_decorator_seam),
     ("layout: exact files/paths created", test_materialize_layout_paths_exist),
     ("layout: GT written as-is (1-based)", test_materialize_gt_written_as_is),
+    ("layout: GT class/vis written as 1 (E3 fix)", test_materialize_gt_class_and_visibility_are_one),
+    ("layout: pred indices 0-6 intact (E3)", test_materialize_pred_indices_0_to_6_intact),
     ("layout: pred frame+1 (0->1)", test_materialize_pred_frame_plus_one),
     ("layout: pred MOT columns + conf=score", test_materialize_pred_columns_and_conf),
     ("layout: seqLength = max 1-based frame", test_materialize_seqlength_is_max_one_based_frame),
