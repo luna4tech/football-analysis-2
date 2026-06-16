@@ -56,6 +56,19 @@ def _torch_load_compat(*args, **kwargs):
     return _orig_torch_load(*args, **kwargs)
 torch.load = _torch_load_compat
 
+# --- numpy alias compatibility shim -----------------------------------------
+# NumPy >= 1.24 removed the np.float / np.int / np.bool aliases that the vendored
+# tracker (tracker/Deep_EIoU.py, tracker/matching.py) still uses as dtypes.
+# Restore them (they were just the Python builtins) so the vendored code runs on
+# modern NumPy without editing it. numpy is a singleton module, so this is
+# visible to the vendored modules too.
+for _np_alias, _py_builtin in (
+    ("float", float), ("int", int), ("bool", bool),
+    ("object", object), ("str", str), ("complex", complex),
+):
+    if not hasattr(np, _np_alias):
+        setattr(np, _np_alias, _py_builtin)
+
 # --- import path setup ------------------------------------------------------
 # CWD is Deep-EIoU/Deep-EIoU (demo.py does sys.path.append('.')); mirror that so
 # `tracker`, `yolox`, `reid`, and sibling `tools` modules import.
