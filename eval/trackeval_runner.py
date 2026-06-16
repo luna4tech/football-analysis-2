@@ -1,11 +1,14 @@
 """
-eval.trackeval_runner — TrackEval MOTChallenge layout writer + output parser.
+eval.trackeval_runner — TrackEval MOTChallenge layout writer, runner, and
+output parser.
 
 This module builds the on-disk directory tree that TrackEval's MOTChallenge
-dataset expects, and parses TrackEval's text output back into a metrics dict.
-The actual ``trackeval`` invocation is a single clearly-marked seam
-(:func:`run_trackeval`) that raises ``NotImplementedError`` until Task E2 wires
-it; this module does NOT import ``trackeval``.
+dataset expects, runs TrackEval (HOTA + CLEAR + Identity) over that layout, and
+parses the raw result back into a metrics dict.
+
+:func:`run_trackeval` imports ``trackeval`` lazily (inside the function only) so
+the rest of this module remains import-light (stdlib + numpy) and CPU-testable
+without TrackEval installed.
 
 MOTChallenge layout written by :func:`materialize_layout`
 ---------------------------------------------------------
@@ -24,8 +27,6 @@ single +1 shift to 1-based happens here in :func:`_pred_to_motchallenge_rows`
 (driven by the prediction's ``frame_base``). This is the ONE place the frame
 base is converted, by design — a stray double-shift or missing shift is the #1
 silent killer of MOT evaluation.
-
-Import-light: stdlib + numpy only.
 """
 
 from __future__ import annotations
@@ -400,17 +401,221 @@ def _extract_metrics(
 
 
 # ---------------------------------------------------------------------------
-# The single TrackEval-run seam (wired in Task E2)
+# TrackEval run seam (wired in Task E2)
+# ---------------------------------------------------------------------------
+
+# Single place where the dataset / benchmark constants are defined so that
+# run_trackeval and materialize_layout cannot diverge.  materialize_layout
+# accepts these as keyword arguments; run_trackeval reads from the LayoutPaths
+# object (which already has bench_split baked in).
+_DEFAULT_BENCHMARK = "SPORTS"
+_DEFAULT_SPLIT = "eval"
+_DEFAULT_CLASS = "pedestrian"
+
+
+def run_trackeval(
+    layout: LayoutPaths,
+    *,
+    class_name: str = _DEFAULT_CLASS,
+    trackeval_path: "str | None" = None,
+) -> dict:
+    """Run TrackEval over a materialized layout and return the raw result dict.
+
+    This is the thin un-testable seam that imports and invokes ``trackeval``
+    (HOTA + CLEAR + Identity) with a sports config (``do_preproc=False``).
+    All extraction and reporting live in :func:`extract_metrics` (pure,
+    CPU-testable) and :func:`evaluate.main`.
+
+    Parameters
+    ----------
+    layout:
+        Paths produced by :func:`materialize_layout`.  The benchmark and split
+        encoded in ``layout.bench_split`` are used automatically.
+    class_name:
+        Class TrackEval evaluates; default ``"pedestrian"`` (sports configs
+        commonly reuse this class label).
+    trackeval_path:
+        Optional path to a TrackEval git clone to insert on ``sys.path``
+        before importing.  Use when TrackEval is not installed as a package.
+
+    Returns
+    -------
+    dict
+        Raw nested result dict from
+        ``trackeval.Evaluator(...).evaluate(dataset_list, metrics_list)``.
+        Pass it to :func:`extract_metrics` for the headline 5-metric summary.
+
+    Raises
+    ------
+    ImportError
+        If ``trackeval`` cannot be imported (dependency not installed / cloned).
+    """
+    if trackeval_path is not None:
+        import sys as _sys
+
+        tp = str(trackeval_path)
+        if tp not in _sys.path:
+            _sys.path.insert(0, tp)
+
+    # Lazy import — trackeval is NOT required on this host.
+    try:
+        import trackeval  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "trackeval not found. Clone TrackEval and pass --trackeval-path, "
+            "or install it (pip install trackeval). "
+            f"Original error: {exc}"
+        ) from exc
+
+    # ---- Evaluator config ----
+    eval_config = trackeval.Evaluator.get_default_eval_config()
+    eval_config["DISPLAY_LESS_PROGRESS"] = True
+    eval_config["OUTPUT_DETAILED"] = True  # write *_detailed.csv for fallback
+    eval_config["PLOT_CURVES"] = False
+
+    # ---- Dataset config ----
+    # Single point where dataset field names live — adjust here if TrackEval
+    # renames a field in a future version.
+    bench_split_parts = layout.bench_split.split("-", 1)
+    benchmark = bench_split_parts[0] if len(bench_split_parts) == 2 else layout.bench_split
+    split = bench_split_parts[1] if len(bench_split_parts) == 2 else _DEFAULT_SPLIT
+
+    dataset_config = trackeval.datasets.MotChallenge2DBox.get_default_dataset_config()
+    dataset_config["GT_FOLDER"] = str(layout.work_dir / "gt" / "mot_challenge")
+    dataset_config["TRACKERS_FOLDER"] = str(
+        layout.work_dir / "trackers" / "mot_challenge"
+    )
+    dataset_config["BENCHMARK"] = benchmark
+    dataset_config["SPLIT_TO_EVAL"] = split
+    dataset_config["TRACKERS_TO_EVAL"] = [layout.tracker_name]
+    dataset_config["CLASSES_TO_EVAL"] = [class_name]
+    dataset_config["SEQMAP_FILE"] = str(layout.seqmap_txt)
+    # Sports config: disable MOT17 pedestrian-distractor removal.
+    dataset_config["DO_PREPROC"] = False
+    dataset_config["PRINT_CONFIG"] = False
+
+    # ---- Metrics ----
+    metrics_list = [
+        trackeval.metrics.HOTA(),
+        trackeval.metrics.CLEAR(),
+        trackeval.metrics.Identity(),
+    ]
+
+    dataset_list = [trackeval.datasets.MotChallenge2DBox(dataset_config)]
+    evaluator = trackeval.Evaluator(eval_config)
+    result, _ = evaluator.evaluate(dataset_list, metrics_list)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# extract_metrics — pure, CPU-testable (Task E2)
 # ---------------------------------------------------------------------------
 
 
-def run_trackeval(layout: LayoutPaths, *, class_name: str = "pedestrian") -> dict:
-    """Run TrackEval over a materialized layout. SEAM — wired in Task E2.
+def extract_metrics(
+    result: dict,
+    *,
+    tracker_name: str,
+    class_name: str = _DEFAULT_CLASS,
+) -> Dict[str, float]:
+    """Extract headline metrics from a TrackEval raw result dict.
 
-    Task E1 deliberately stops here: this is the one function that will import
-    and invoke ``trackeval`` (HOTA + CLEAR + Identity, sports config with
-    ``do_preproc=False``), then call :func:`parse_trackeval_output` on the
-    tracker directory and return the metrics dict. Until then it raises so the
-    CLI is coherent but the heavy dependency is never required on this host.
+    The raw result comes from
+    ``trackeval.Evaluator(...).evaluate(dataset_list, metrics_list)``
+    — a nested dict keyed by dataset name, then tracker, then
+    ``"COMBINED_SEQ"``, then class name.
+
+    GOTCHA — array vs scalar
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    TrackEval's HOTA / DetA / AssA are 1-D arrays over IoU alpha thresholds
+    (default 19 thresholds from 0.05 to 0.95).  The headline scalar reported
+    by the MOTChallenge leaderboard is the **mean over those alphas**
+    (``float(np.mean(arr))``).  MOTA (from CLEAR) and IDF1 (from Identity)
+    are plain scalars.  This function normalises both shapes and returns floats.
+
+    The result-key path is the SINGLE location to update if a future TrackEval
+    version renames a key.
+
+    Parameters
+    ----------
+    result:
+        Raw nested dict from ``Evaluator.evaluate``.
+    tracker_name:
+        The tracker name used when calling :func:`materialize_layout`.
+    class_name:
+        Class evaluated; default ``"pedestrian"``.
+
+    Returns
+    -------
+    dict
+        ``{HOTA, DetA, AssA, MOTA, IDF1}`` as floats.
+
+    Raises
+    ------
+    KeyError
+        If a required key is missing anywhere along the result path.
     """
-    raise NotImplementedError("wired in Task E2")
+    # Navigate the result structure.  Each level is labelled so errors name
+    # exactly where the traversal failed, making a Colab 1-line fix easy.
+    try:
+        # Level 1: dataset name.  TrackEval uses the class name of the dataset.
+        # With MotChallenge2DBox there is exactly one dataset; pop the only key.
+        if len(result) != 1:
+            available = list(result.keys())
+            raise KeyError(
+                f"expected exactly 1 dataset in result, got {len(result)}: {available}"
+            )
+        dataset_key = next(iter(result))
+        by_tracker: dict = result[dataset_key]
+    except (AttributeError, TypeError) as exc:
+        raise KeyError(f"result has unexpected structure: {exc}") from exc
+
+    # Level 2: tracker name.
+    if tracker_name not in by_tracker:
+        raise KeyError(
+            f"tracker {tracker_name!r} not found in result; "
+            f"available: {list(by_tracker.keys())}"
+        )
+    by_seq: dict = by_tracker[tracker_name]
+
+    # Level 3: COMBINED_SEQ.
+    combined_key = "COMBINED_SEQ"
+    if combined_key not in by_seq:
+        raise KeyError(
+            f"{combined_key!r} not in result[{dataset_key!r}][{tracker_name!r}]; "
+            f"available: {list(by_seq.keys())}"
+        )
+    by_class: dict = by_seq[combined_key]
+
+    # Level 4: class name.
+    if class_name not in by_class:
+        raise KeyError(
+            f"class {class_name!r} not in COMBINED_SEQ; "
+            f"available: {list(by_class.keys())}"
+        )
+    metrics_raw: dict = by_class[class_name]
+
+    def _scalar(key: str) -> float:
+        """Pull a scalar or array metric, returning float(mean) for arrays."""
+        if key not in metrics_raw:
+            raise KeyError(
+                f"metric {key!r} missing from COMBINED_SEQ[{class_name!r}]; "
+                f"available: {sorted(k for k in metrics_raw if not k.startswith('_'))}"
+            )
+        val = metrics_raw[key]
+        # HOTA/DetA/AssA are arrays over alpha thresholds; MOTA/IDF1 are scalars.
+        try:
+            arr = np.asarray(val, dtype=float)
+            if arr.ndim == 0:
+                return float(arr)
+            return float(np.mean(arr))
+        except (TypeError, ValueError) as exc:
+            raise KeyError(f"cannot convert {key!r}={val!r} to float: {exc}") from exc
+
+    return {
+        "HOTA": _scalar("HOTA"),
+        "DetA": _scalar("DetA"),
+        "AssA": _scalar("AssA"),
+        "MOTA": _scalar("MOTA"),
+        "IDF1": _scalar("IDF1"),
+    }

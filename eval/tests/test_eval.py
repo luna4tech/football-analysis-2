@@ -1,12 +1,12 @@
 """
-Pure-Python unit tests for the eval package (Task E1).
+Pure-Python unit tests for the eval package (Tasks E1 + E2).
 
 Run with:
     python eval/tests/test_eval.py
 
 No pytest, torch, trackeval, scipy, or GPU required — stdlib + numpy only.
 
-Covers:
+Task E1 coverage:
   * load_pred parses sample refined.txt rows (0-based, score kept).
   * load_gt (motchallenge) parses sample gt.txt (1-based, as-is).
   * GT-adapter seam: a custom fmt registers and routes; unknown fmt errors.
@@ -17,6 +17,16 @@ Covers:
   * parse_trackeval_output extracts HOTA/DetA/AssA/MOTA/IDF1 from a sample
     *_summary.txt fixture (and a *_detailed.csv COMBINED fixture), and raises a
     clear error when a required metric is missing.
+
+Task E2 coverage (CPU-only, no trackeval/scipy):
+  * extract_metrics: HOTA/DetA/AssA returned as mean of alpha arrays;
+    MOTA/IDF1 as scalars; clear error when an expected key is missing.
+  * format_metrics_table + write_metrics_json produce the documented shape.
+  * run_evaluation end-to-end with an INJECTED stub _runner that returns a
+    fake result: asserts metrics.json is written with the 5 metrics; no
+    trackeval import triggered.
+  * run_trackeval raises ImportError when trackeval is not installed (not
+    NotImplementedError — that was the E1 seam; E2 wires it).
 """
 
 from __future__ import annotations
@@ -41,9 +51,15 @@ from eval.gt_adapters import (
     register_gt_loader,
 )
 from eval.trackeval_runner import (
+    extract_metrics,
     materialize_layout,
     parse_trackeval_output,
     run_trackeval,
+)
+from eval.evaluate import (
+    format_metrics_table,
+    run_evaluation,
+    write_metrics_json,
 )
 
 # ---------------------------------------------------------------------------
@@ -440,18 +456,236 @@ def test_parse_respects_class_name():
 
 
 # ---------------------------------------------------------------------------
-# 5. run_trackeval seam
+# 5. run_trackeval: no-trackeval host raises ImportError (E2 wired, but dep
+#    absent on this machine)
 # ---------------------------------------------------------------------------
 
 
-def test_run_trackeval_is_not_implemented_seam():
+def test_run_trackeval_raises_import_error_without_trackeval():
+    """On a host without trackeval installed, run_trackeval raises ImportError."""
+    # We need a real LayoutPaths-like object; the simplest is to build a minimal
+    # one via materialize_layout with synthetic data.
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = load_gt(_write(Path(tmp) / "gt.txt", _SAMPLE_GT))
+        pred = load_pred(_write(Path(tmp) / "refined.txt", _SAMPLE_PRED))
+        layout = materialize_layout(Path(tmp) / "work", "M59", gt, pred)
+        try:
+            import trackeval as _te  # type: ignore[import]  # noqa: F401
+            # trackeval IS installed — skip this test gracefully.
+            print("  [skip] trackeval is installed on this host; ImportError test not applicable")
+            return
+        except ImportError:
+            pass
+        # trackeval is NOT installed; expect ImportError with a helpful message.
+        raised = False
+        try:
+            run_trackeval(layout)
+        except ImportError as exc:
+            raised = True
+            assert "trackeval" in str(exc).lower(), str(exc)
+        assert raised, "run_trackeval must raise ImportError when trackeval is absent"
+
+
+# ---------------------------------------------------------------------------
+# 6. extract_metrics (Task E2 — pure, CPU-testable)
+# ---------------------------------------------------------------------------
+
+# Fake raw result dict mirroring what TrackEval's Evaluator.evaluate returns.
+# Structure: result[dataset_key][tracker_name]["COMBINED_SEQ"][class_name][metric_name]
+#
+# HOTA/DetA/AssA are arrays over alpha thresholds; MOTA/IDF1 are scalars.
+def _fake_result(
+    tracker: str = "refined",
+    cls: str = "pedestrian",
+    hota: float = 72.345,
+    det_a: float = 68.1,
+    ass_a: float = 77.9,
+    mota: float = 65.5,
+    idf1: float = 81.25,
+) -> dict:
+    alpha_count = 19
+    per_class = {
+        "HOTA": np.full(alpha_count, hota),
+        "DetA": np.full(alpha_count, det_a),
+        "AssA": np.full(alpha_count, ass_a),
+        "MOTA": mota,
+        "IDF1": idf1,
+        # Extra keys TrackEval emits — must be tolerated.
+        "_extra": "ignore me",
+        "LocA": np.full(alpha_count, 88.0),
+    }
+    return {
+        "MotChallenge2DBox": {
+            tracker: {
+                "COMBINED_SEQ": {
+                    cls: per_class,
+                },
+            },
+        },
+    }
+
+
+def test_extract_metrics_array_mean():
+    """HOTA/DetA/AssA are returned as the mean over their alpha arrays."""
+    result = _fake_result(hota=72.345, det_a=68.1, ass_a=77.9)
+    m = extract_metrics(result, tracker_name="refined")
+    assert set(m) == {"HOTA", "DetA", "AssA", "MOTA", "IDF1"}, m
+    assert abs(m["HOTA"] - 72.345) < 1e-6, m
+    assert abs(m["DetA"] - 68.1) < 1e-6, m
+    assert abs(m["AssA"] - 77.9) < 1e-6, m
+
+
+def test_extract_metrics_mota_idf1_scalars():
+    """MOTA and IDF1 (plain scalars) are returned unchanged."""
+    result = _fake_result(mota=65.5, idf1=81.25)
+    m = extract_metrics(result, tracker_name="refined")
+    assert abs(m["MOTA"] - 65.5) < 1e-9, m
+    assert abs(m["IDF1"] - 81.25) < 1e-9, m
+
+
+def test_extract_metrics_wrong_tracker_raises():
+    result = _fake_result()
     raised = False
     try:
-        run_trackeval(object())  # type: ignore[arg-type]
-    except NotImplementedError as exc:
+        extract_metrics(result, tracker_name="wrong_tracker")
+    except KeyError as exc:
         raised = True
-        assert "Task E2" in str(exc), str(exc)
-    assert raised, "run_trackeval must remain a NotImplementedError seam in E1"
+        assert "wrong_tracker" in str(exc), str(exc)
+    assert raised
+
+
+def test_extract_metrics_missing_metric_raises():
+    result = _fake_result()
+    # Drop MOTA from the inner dict.
+    del result["MotChallenge2DBox"]["refined"]["COMBINED_SEQ"]["pedestrian"]["MOTA"]
+    raised = False
+    try:
+        extract_metrics(result, tracker_name="refined")
+    except KeyError as exc:
+        raised = True
+        assert "MOTA" in str(exc), str(exc)
+    assert raised
+
+
+def test_extract_metrics_custom_class():
+    result = _fake_result(tracker="t", cls="player")
+    m = extract_metrics(result, tracker_name="t", class_name="player")
+    assert abs(m["HOTA"] - 72.345) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 7. format_metrics_table (Task E2)
+# ---------------------------------------------------------------------------
+
+
+def test_format_metrics_table_structure():
+    metrics = {"HOTA": 72.345, "DetA": 68.1, "AssA": 77.9, "MOTA": 65.5, "IDF1": 81.25}
+    table = format_metrics_table(metrics)
+    for key in ("HOTA", "DetA", "AssA", "MOTA", "IDF1"):
+        assert key in table, f"{key} not in table:\n{table}"
+    # All five values appear as rounded floats.
+    assert "72.345" in table
+    assert "65.500" in table
+
+
+def test_format_metrics_table_missing_key_shows_na():
+    # Missing metrics should display N/A rather than raising.
+    metrics = {"HOTA": 72.345}
+    table = format_metrics_table(metrics)
+    assert "N/A" in table, table
+
+
+# ---------------------------------------------------------------------------
+# 8. write_metrics_json (Task E2)
+# ---------------------------------------------------------------------------
+
+
+def test_write_metrics_json_schema():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "metrics.json"
+        metrics = {"HOTA": 72.345, "DetA": 68.1, "AssA": 77.9, "MOTA": 65.5, "IDF1": 81.25}
+        write_metrics_json(out, "M59", "refined", metrics)
+        assert out.is_file(), "metrics.json not written"
+        import json
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["seq_name"] == "M59"
+        assert data["tracker_name"] == "refined"
+        assert set(data["metrics"]) == {"HOTA", "DetA", "AssA", "MOTA", "IDF1"}
+        assert abs(data["metrics"]["HOTA"] - 72.345) < 1e-9
+
+
+def test_write_metrics_json_creates_parents():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "deep" / "nested" / "metrics.json"
+        write_metrics_json(out, "S", "refined", {"HOTA": 1.0, "DetA": 1.0, "AssA": 1.0, "MOTA": 1.0, "IDF1": 1.0})
+        assert out.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 9. run_evaluation end-to-end with injected stub runner (Task E2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_evaluation_injected_stub_writes_metrics_json():
+    """Full end-to-end with a fake _runner — no trackeval import triggered."""
+    import json as _json
+
+    def _stub_runner(layout, **kwargs):
+        """Fake runner: returns a fake result dict; records the call."""
+        _stub_runner.called = True
+        return _fake_result(tracker=layout.tracker_name)
+
+    _stub_runner.called = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        gt_file = _write(Path(tmp) / "gt.txt", _SAMPLE_GT)
+        pred_file = _write(Path(tmp) / "refined.txt", _SAMPLE_PRED)
+        work_dir = Path(tmp) / "work"
+        out_path = Path(tmp) / "metrics.json"
+
+        metrics = run_evaluation(
+            pred_file,
+            gt_file,
+            "M59",
+            work_dir,
+            out_path,
+            _runner=_stub_runner,
+        )
+
+        assert _stub_runner.called, "injected stub must be called"
+        assert set(metrics) == {"HOTA", "DetA", "AssA", "MOTA", "IDF1"}
+        assert out_path.is_file(), "metrics.json must be written"
+        data = _json.loads(out_path.read_text(encoding="utf-8"))
+        assert data["seq_name"] == "M59"
+        assert data["tracker_name"] == "refined"
+        assert set(data["metrics"]) == {"HOTA", "DetA", "AssA", "MOTA", "IDF1"}
+
+
+def test_run_evaluation_stub_no_trackeval_imported():
+    """Verify the stub path never imports trackeval (by catching ImportError if it did)."""
+    import sys as _sys
+
+    # Temporarily block trackeval from importing.
+    _sentinel = object()
+    _sys.modules.setdefault("trackeval", _sentinel)  # type: ignore[arg-type]
+
+    def _stub(layout, **kwargs):
+        return _fake_result(tracker=layout.tracker_name)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        gt_file = _write(Path(tmp) / "gt.txt", _SAMPLE_GT)
+        pred_file = _write(Path(tmp) / "refined.txt", _SAMPLE_PRED)
+        work_dir = Path(tmp) / "work"
+        out_path = Path(tmp) / "metrics.json"
+        # Must not raise even with the blocked trackeval sentinel.
+        metrics = run_evaluation(
+            pred_file, gt_file, "M59", work_dir, out_path, _runner=_stub
+        )
+        assert "HOTA" in metrics
+
+    # Clean up sentinel if we added it.
+    if _sys.modules.get("trackeval") is _sentinel:
+        del _sys.modules["trackeval"]
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +693,7 @@ def test_run_trackeval_is_not_implemented_seam():
 # ---------------------------------------------------------------------------
 
 _TESTS = [
+    # Task E1 tests
     ("pred: load_pred basic (0-based, score kept)", test_load_pred_basic),
     ("pred: load_pred tolerates blank/short lines", test_load_pred_tolerates_blank_and_short_lines),
     ("gt: load_gt motchallenge basic (1-based as-is)", test_load_gt_motchallenge_basic),
@@ -482,13 +717,25 @@ _TESTS = [
     ("parse: missing metric raises clear error", test_parse_missing_metric_raises_clear_error),
     ("parse: no output file raises", test_parse_no_output_file_raises),
     ("parse: respects class_name", test_parse_respects_class_name),
-    ("seam: run_trackeval NotImplementedError", test_run_trackeval_is_not_implemented_seam),
+    # Task E2 tests
+    ("E2 run_trackeval: ImportError without trackeval", test_run_trackeval_raises_import_error_without_trackeval),
+    ("E2 extract_metrics: HOTA/DetA/AssA as array means", test_extract_metrics_array_mean),
+    ("E2 extract_metrics: MOTA/IDF1 scalars", test_extract_metrics_mota_idf1_scalars),
+    ("E2 extract_metrics: wrong tracker raises KeyError", test_extract_metrics_wrong_tracker_raises),
+    ("E2 extract_metrics: missing metric raises KeyError", test_extract_metrics_missing_metric_raises),
+    ("E2 extract_metrics: custom class_name", test_extract_metrics_custom_class),
+    ("E2 format_table: 5 keys + values present", test_format_metrics_table_structure),
+    ("E2 format_table: missing key shows N/A", test_format_metrics_table_missing_key_shows_na),
+    ("E2 metrics.json: schema correct", test_write_metrics_json_schema),
+    ("E2 metrics.json: creates parent dirs", test_write_metrics_json_creates_parents),
+    ("E2 run_evaluation: stub runner writes metrics.json", test_run_evaluation_injected_stub_writes_metrics_json),
+    ("E2 run_evaluation: stub does not import trackeval", test_run_evaluation_stub_no_trackeval_imported),
 ]
 
 
 def main() -> int:
     print("=" * 60)
-    print("eval unit tests (Task E1, CPU-only)")
+    print("eval unit tests (Tasks E1 + E2, CPU-only)")
     print("=" * 60)
     for test_name, fn in _TESTS:
         run_test(test_name, fn)

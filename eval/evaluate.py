@@ -1,8 +1,9 @@
 """
-eval.evaluate — CLI: load GT + predictions and materialize the TrackEval layout.
+eval.evaluate — CLI: load GT + predictions, materialize TrackEval layout, run
+evaluation, and report metrics.
 
-This is the standalone tracking-evaluation entrypoint. It is COMPLETELY separate
-from the pipeline: it reads ``refined.txt`` and a GT file from disk post-hoc.
+This is the standalone tracking-evaluation entrypoint, completely separate from
+the pipeline: it reads ``refined.txt`` and a GT file from disk post-hoc.
 
 Flow
 ----
@@ -10,32 +11,99 @@ Flow
    ``pipeline.artifacts.get_artifact_paths``).
 2. ``load_gt`` (GT format seam) -> ``load_pred`` (0-based refined.txt).
 3. ``materialize_layout`` writes the MOTChallenge tree TrackEval expects.
-4. The actual TrackEval run is a single seam (``run_trackeval``) that raises
-   ``NotImplementedError("wired in Task E2")`` — Task E2 fills that hole and the
-   reporting.
+4. ``run_trackeval`` (INJECTABLE via the ``_runner`` parameter — default calls the
+   real TrackEval; override in tests to avoid the heavy dep) runs evaluation.
+5. ``extract_metrics`` pulls HOTA/DetA/AssA/MOTA/IDF1 from the raw result.
+6. Print an aligned metrics table; write ``metrics.json``.
 
 Run::
 
     python -m eval.evaluate --pred path/refined.txt --gt path/gt.txt --seq-name M59
     python -m eval.evaluate --video match.mp4 --gt gt.txt   # auto-locate refined.txt
 
-Import-light: stdlib + numpy only. Does NOT import trackeval.
+Import-light: stdlib + numpy only. Does NOT import trackeval at the top level.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+from typing import Callable, Dict, Optional
 
-# Ensure the repo root is importable so ``pipeline.artifacts`` resolves when this
-# module is run as a script or via ``-m eval.evaluate`` from anywhere.
+# Ensure the repo root is importable so ``pipeline.artifacts`` resolves when
+# this module is run as a script or via ``-m eval.evaluate`` from anywhere.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from eval.gt_adapters import GT_LOADERS, load_gt, load_pred
-from eval.trackeval_runner import materialize_layout, run_trackeval  # noqa: F401
+from eval.trackeval_runner import (
+    extract_metrics,
+    materialize_layout,
+    run_trackeval,
+)
+
+
+# ---------------------------------------------------------------------------
+# Reporting helpers (pure, CPU-testable)
+# ---------------------------------------------------------------------------
+
+_METRIC_KEYS = ("HOTA", "DetA", "AssA", "MOTA", "IDF1")
+
+
+def format_metrics_table(metrics: Dict[str, float]) -> str:
+    """Return an aligned metrics table string.
+
+    Example::
+
+        Metric       Value
+        ----------  -------
+        HOTA         72.345
+        DetA         68.100
+        AssA         77.900
+        MOTA         65.500
+        IDF1         81.250
+    """
+    lines = [f"{'Metric':<12}{'Value':>8}", "-" * 12 + "  " + "-" * 7]
+    for key in _METRIC_KEYS:
+        val = metrics.get(key)
+        if val is None:
+            lines.append(f"{key:<12}{'N/A':>8}")
+        else:
+            lines.append(f"{key:<12}{val:>8.3f}")
+    return "\n".join(lines)
+
+
+def write_metrics_json(
+    out_path: Path,
+    seq_name: str,
+    tracker_name: str,
+    metrics: Dict[str, float],
+) -> None:
+    """Write ``metrics.json`` with the 5 headline metrics.
+
+    Schema::
+
+        {
+          "seq_name": "M59",
+          "tracker_name": "refined",
+          "metrics": {"HOTA": ..., "DetA": ..., "AssA": ..., "MOTA": ..., "IDF1": ...}
+        }
+    """
+    payload = {
+        "seq_name": seq_name,
+        "tracker_name": tracker_name,
+        "metrics": {k: metrics[k] for k in _METRIC_KEYS if k in metrics},
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# CLI parser
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,8 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m eval.evaluate",
         description=(
             "Score the pipeline's refined.txt against ground truth via "
-            "TrackEval (HOTA/MOTA/IDF1). Task E1 loads inputs and materializes "
-            "the TrackEval layout; the run itself is wired in Task E2."
+            "TrackEval (HOTA/DetA/AssA/MOTA/IDF1). "
+            "Reads refined.txt and a GT file post-hoc; no GPU or pipeline "
+            "runtime required."
         ),
     )
 
@@ -59,8 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--video",
         type=str,
         default=None,
-        help="path to the source video; refined.txt is auto-located via "
-        "pipeline.artifacts.get_artifact_paths(video, artifacts_dir)",
+        help=(
+            "path to the source video; refined.txt is auto-located via "
+            "pipeline.artifacts.get_artifact_paths(video, artifacts_dir)"
+        ),
     )
 
     parser.add_argument(
@@ -124,14 +195,45 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="image height for seqinfo.ini (does not affect IoU-based metrics)",
     )
+    parser.add_argument(
+        "--class-name",
+        type=str,
+        default="pedestrian",
+        help=(
+            "class label TrackEval evaluates under (default: pedestrian). "
+            "Some sports datasets use 'player' or 'athlete'."
+        ),
+    )
+    parser.add_argument(
+        "--trackeval-path",
+        type=str,
+        default=None,
+        help=(
+            "path to a TrackEval git clone; inserted on sys.path before "
+            "importing trackeval (use when TrackEval is not pip-installed)"
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help=(
+            "path for metrics.json output "
+            "(default: same directory as --pred / the auto-located refined.txt)"
+        ),
+    )
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _resolve_pred_path(args: argparse.Namespace) -> Path:
     """Return the refined.txt path from --pred or auto-located from --video."""
     if args.pred:
         return Path(args.pred)
-    # --video path: defer the pipeline import until needed.
     from pipeline.artifacts import get_artifact_paths
 
     paths = get_artifact_paths(args.video, base_dir=args.artifacts_dir)
@@ -158,45 +260,81 @@ def _resolve_work_dir(args: argparse.Namespace) -> Path:
     return Path(tempfile.mkdtemp(prefix="eval_trackeval_"))
 
 
-def main(argv: "list[str] | None" = None) -> int:
-    args = build_parser().parse_args(argv)
+def _resolve_out_path(args: argparse.Namespace, pred_path: Path) -> Path:
+    """Resolve the metrics.json output path."""
+    if args.out:
+        return Path(args.out)
+    return pred_path.parent / "metrics.json"
 
-    pred_path = _resolve_pred_path(args)
-    gt_path = Path(args.gt)
-    seq_name = _resolve_seq_name(args, pred_path)
-    work_dir = _resolve_work_dir(args)
 
-    if not pred_path.is_file():
-        print(f"ERROR: prediction file not found: {pred_path}", file=sys.stderr)
-        return 2
-    if not gt_path.is_file():
-        print(f"ERROR: ground-truth file not found: {gt_path}", file=sys.stderr)
-        return 2
+# ---------------------------------------------------------------------------
+# Core logic (injectable runner for testing)
+# ---------------------------------------------------------------------------
 
-    print(f"[eval] GT      : {gt_path}  (format={args.gt_format})")
-    print(f"[eval] pred    : {pred_path}")
-    print(f"[eval] seq     : {seq_name}")
-    print(f"[eval] work-dir: {work_dir}")
 
-    gt = load_gt(gt_path, fmt=args.gt_format)
+def run_evaluation(
+    pred_path: Path,
+    gt_path: Path,
+    seq_name: str,
+    work_dir: Path,
+    out_path: Path,
+    *,
+    gt_format: str = "motchallenge",
+    tracker_name: str = "refined",
+    benchmark: str = "SPORTS",
+    split: str = "eval",
+    class_name: str = "pedestrian",
+    img_width: Optional[int] = None,
+    img_height: Optional[int] = None,
+    trackeval_path: Optional[str] = None,
+    _runner: Optional[Callable] = None,
+) -> Dict[str, float]:
+    """Load, materialize, run TrackEval (or a stub), extract metrics, and report.
+
+    The ``_runner`` parameter is injectable so CPU tests can pass a stub without
+    triggering the real TrackEval import.  Defaults to :func:`run_trackeval`.
+
+    Parameters
+    ----------
+    class_name:
+        Class label TrackEval evaluates under (default ``"pedestrian"``; some
+        sports datasets use ``"player"`` or ``"athlete"``). Forwarded to both
+        :func:`run_trackeval` and :func:`extract_metrics`.
+
+    Returns
+    -------
+    dict
+        ``{HOTA, DetA, AssA, MOTA, IDF1}`` as floats.
+    """
+    if _runner is None:
+        _runner = run_trackeval
+
+    print(f"[eval] GT       : {gt_path}  (format={gt_format})")
+    print(f"[eval] pred     : {pred_path}")
+    print(f"[eval] seq      : {seq_name}")
+    print(f"[eval] work-dir : {work_dir}")
+
+    gt = load_gt(gt_path, fmt=gt_format)
     pred = load_pred(pred_path)
-    print(f"[eval] loaded GT rows={len(gt)} (frame_base={gt.frame_base}), "
-          f"pred rows={len(pred)} (frame_base={pred.frame_base})")
+    print(
+        f"[eval] loaded GT rows={len(gt)} (frame_base={gt.frame_base}), "
+        f"pred rows={len(pred)} (frame_base={pred.frame_base})"
+    )
 
-    layout_kwargs = {}
-    if args.img_width is not None:
-        layout_kwargs["img_width"] = args.img_width
-    if args.img_height is not None:
-        layout_kwargs["img_height"] = args.img_height
+    layout_kwargs: dict = {}
+    if img_width is not None:
+        layout_kwargs["img_width"] = img_width
+    if img_height is not None:
+        layout_kwargs["img_height"] = img_height
 
     layout = materialize_layout(
         work_dir,
         seq_name,
         gt,
         pred,
-        tracker_name=args.tracker_name,
-        benchmark=args.benchmark,
-        split=args.split,
+        tracker_name=tracker_name,
+        benchmark=benchmark,
+        split=split,
         **layout_kwargs,
     )
 
@@ -206,16 +344,77 @@ def main(argv: "list[str] | None" = None) -> int:
     print(f"         seqmap   : {layout.seqmap_txt}")
     print(f"         pred data: {layout.tracker_txt}")
 
-    # ---- single TrackEval-run seam (wired in Task E2) ----
+    # ---- Run TrackEval (or injected stub) ----
+    runner_kwargs: dict = {"class_name": class_name}
+    if trackeval_path is not None:
+        runner_kwargs["trackeval_path"] = trackeval_path
+
+    raw_result = _runner(layout, **runner_kwargs)
+
+    # ---- Extract headline metrics ----
+    metrics = extract_metrics(raw_result, tracker_name=tracker_name, class_name=class_name)
+
+    # ---- Report ----
+    print("\n[eval] Tracking metrics:")
+    print(format_metrics_table(metrics))
+
+    write_metrics_json(out_path, seq_name, tracker_name, metrics)
+    print(f"\n[eval] metrics.json written to: {out_path}")
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------------
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    pred_path = _resolve_pred_path(args)
+    gt_path = Path(args.gt)
+    seq_name = _resolve_seq_name(args, pred_path)
+    work_dir = _resolve_work_dir(args)
+    out_path = _resolve_out_path(args, pred_path)
+
+    if not pred_path.is_file():
+        print(f"ERROR: prediction file not found: {pred_path}", file=sys.stderr)
+        return 2
+    if not gt_path.is_file():
+        print(f"ERROR: ground-truth file not found: {gt_path}", file=sys.stderr)
+        return 2
+
     try:
-        metrics = run_trackeval(layout)
-        print("[eval] metrics:", metrics)
-    except NotImplementedError as exc:
-        print(
-            f"[eval] TrackEval run not wired yet ({exc}). "
-            "Layout is materialized and ready; Task E2 fills the run + report.",
+        run_evaluation(
+            pred_path,
+            gt_path,
+            seq_name,
+            work_dir,
+            out_path,
+            gt_format=args.gt_format,
+            tracker_name=args.tracker_name,
+            benchmark=args.benchmark,
+            split=args.split,
+            class_name=args.class_name,
+            img_width=args.img_width,
+            img_height=args.img_height,
+            trackeval_path=args.trackeval_path,
         )
-        return 0
+    except ImportError as exc:
+        print(
+            f"[eval] ERROR: {exc}\n"
+            "Install/clone TrackEval and pass --trackeval-path, or run in an "
+            "environment where it is pip-installed.",
+            file=sys.stderr,
+        )
+        return 1
+    except (KeyError, ValueError) as exc:
+        print(
+            f"[eval] ERROR: {exc}",
+            file=sys.stderr,
+        )
+        return 1
 
     return 0
 
