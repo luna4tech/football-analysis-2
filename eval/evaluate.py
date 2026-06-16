@@ -40,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from eval.gt_adapters import GT_LOADERS, load_gt, load_pred
 from eval.trackeval_runner import (
+    extract_all_metrics,
     extract_metrics,
     materialize_layout,
     run_trackeval,
@@ -81,22 +82,35 @@ def write_metrics_json(
     seq_name: str,
     tracker_name: str,
     metrics: Dict[str, float],
+    all_metrics: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> None:
-    """Write ``metrics.json`` with the 5 headline metrics.
+    """Write ``metrics.json``: the 5 headline metrics plus, when provided, the
+    FULL metric set by family.
 
     Schema::
 
         {
           "seq_name": "M59",
           "tracker_name": "refined",
-          "metrics": {"HOTA": ..., "DetA": ..., "AssA": ..., "MOTA": ..., "IDF1": ...}
+          "metrics": {"HOTA": ..., "DetA": ..., "AssA": ..., "MOTA": ..., "IDF1": ...},
+          "all_metrics": {
+            "HOTA":     {"HOTA": ..., "DetA": ..., "AssA": ..., "DetRe": ..., ...},
+            "CLEAR":    {"MOTA": ..., "MOTP": ..., "IDSW": 124, "CLR_FP": 25106, ...},
+            "Identity": {"IDF1": ..., "IDR": ..., "IDP": ...},
+            "Count":    {"Dets": 116748, "GT_Dets": 102918, "IDs": 64, "GT_IDs": 25}
+          }
         }
+
+    Rate metrics are percentages (0-100); counts are raw ints. ``all_metrics`` is
+    omitted when not supplied (keeps the 5-metric output backward-compatible).
     """
-    payload = {
+    payload: Dict[str, object] = {
         "seq_name": seq_name,
         "tracker_name": tracker_name,
         "metrics": {k: metrics[k] for k in _METRIC_KEYS if k in metrics},
     }
+    if all_metrics is not None:
+        payload["all_metrics"] = all_metrics
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -351,15 +365,22 @@ def run_evaluation(
 
     raw_result = _runner(layout, **runner_kwargs)
 
-    # ---- Extract headline metrics ----
+    # ---- Extract headline metrics + the full per-family dump ----
     metrics = extract_metrics(raw_result, tracker_name=tracker_name, class_name=class_name)
+    full_metrics = extract_all_metrics(
+        raw_result, tracker_name=tracker_name, class_name=class_name
+    )
 
     # ---- Report ----
     print("\n[eval] Tracking metrics:")
     print(format_metrics_table(metrics))
 
-    write_metrics_json(out_path, seq_name, tracker_name, metrics)
-    print(f"\n[eval] metrics.json written to: {out_path}")
+    write_metrics_json(out_path, seq_name, tracker_name, metrics, all_metrics=full_metrics)
+    print(
+        f"\n[eval] metrics.json written to: {out_path} "
+        f"(headline + all {sum(len(v) for v in full_metrics.values())} metrics "
+        f"across {len(full_metrics)} families)"
+    )
 
     return metrics
 

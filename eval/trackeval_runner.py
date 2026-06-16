@@ -542,6 +542,60 @@ def run_trackeval(
 # extract_metrics — pure, CPU-testable (Task E2)
 # ---------------------------------------------------------------------------
 
+# Field-type classification mirroring TrackEval's metric definitions, used by
+# extract_all_metrics to format the FULL dump to match TrackEval's printed table:
+# float/rate fields -> percentages (x100), count/integer fields -> raw ints,
+# per-alpha float arrays -> mean (x100). Integer-array fields (HOTA_TP/FN/FP) are
+# omitted (TrackEval's summary table omits them too). SINGLE place to adjust if a
+# TrackEval version renames fields.
+_INTEGER_FIELDS = {
+    "CLEAR": {"CLR_TP", "CLR_FN", "CLR_FP", "IDSW", "MT", "PT", "ML", "Frag"},
+    "Identity": {"IDTP", "IDFN", "IDFP"},
+    "Count": {"Dets", "GT_Dets", "IDs", "GT_IDs"},
+}
+_SKIP_FIELDS = {"HOTA": {"HOTA_TP", "HOTA_FN", "HOTA_FP"}}
+
+
+def _combined_seq_class(result: dict, tracker_name: str, class_name: str) -> dict:
+    """Navigate result -> dataset -> tracker -> COMBINED_SEQ -> class.
+
+    Returns the per-class dict of metric families. Each level raises a labelled
+    ``KeyError`` naming exactly where traversal failed (the single Colab 1-line
+    fix point if TrackEval renames a key).
+    """
+    try:
+        if len(result) != 1:
+            raise KeyError(
+                f"expected exactly 1 dataset in result, got {len(result)}: "
+                f"{list(result.keys())}"
+            )
+        dataset_key = next(iter(result))
+        by_tracker: dict = result[dataset_key]
+    except (AttributeError, TypeError) as exc:
+        raise KeyError(f"result has unexpected structure: {exc}") from exc
+
+    if tracker_name not in by_tracker:
+        raise KeyError(
+            f"tracker {tracker_name!r} not found in result; "
+            f"available: {list(by_tracker.keys())}"
+        )
+    by_seq: dict = by_tracker[tracker_name]
+
+    combined_key = "COMBINED_SEQ"
+    if combined_key not in by_seq:
+        raise KeyError(
+            f"{combined_key!r} not in result[...][{tracker_name!r}]; "
+            f"available: {list(by_seq.keys())}"
+        )
+    by_class: dict = by_seq[combined_key]
+
+    if class_name not in by_class:
+        raise KeyError(
+            f"class {class_name!r} not in COMBINED_SEQ; "
+            f"available: {list(by_class.keys())}"
+        )
+    return by_class[class_name]
+
 
 def extract_metrics(
     result: dict,
@@ -591,45 +645,7 @@ def extract_metrics(
     KeyError
         If a required key is missing anywhere along the result path.
     """
-    # Navigate the result structure.  Each level is labelled so errors name
-    # exactly where the traversal failed, making a Colab 1-line fix easy.
-    try:
-        # Level 1: dataset name.  TrackEval uses the class name of the dataset.
-        # With MotChallenge2DBox there is exactly one dataset; pop the only key.
-        if len(result) != 1:
-            available = list(result.keys())
-            raise KeyError(
-                f"expected exactly 1 dataset in result, got {len(result)}: {available}"
-            )
-        dataset_key = next(iter(result))
-        by_tracker: dict = result[dataset_key]
-    except (AttributeError, TypeError) as exc:
-        raise KeyError(f"result has unexpected structure: {exc}") from exc
-
-    # Level 2: tracker name.
-    if tracker_name not in by_tracker:
-        raise KeyError(
-            f"tracker {tracker_name!r} not found in result; "
-            f"available: {list(by_tracker.keys())}"
-        )
-    by_seq: dict = by_tracker[tracker_name]
-
-    # Level 3: COMBINED_SEQ.
-    combined_key = "COMBINED_SEQ"
-    if combined_key not in by_seq:
-        raise KeyError(
-            f"{combined_key!r} not in result[{dataset_key!r}][{tracker_name!r}]; "
-            f"available: {list(by_seq.keys())}"
-        )
-    by_class: dict = by_seq[combined_key]
-
-    # Level 4: class name.
-    if class_name not in by_class:
-        raise KeyError(
-            f"class {class_name!r} not in COMBINED_SEQ; "
-            f"available: {list(by_class.keys())}"
-        )
-    metrics_raw: dict = by_class[class_name]
+    metrics_raw = _combined_seq_class(result, tracker_name, class_name)
 
     # Level 5: metric FAMILY. TrackEval nests per-class results one level deeper,
     # keyed by the metric class that produced them ("HOTA", "CLEAR", "Identity",
@@ -675,3 +691,49 @@ def extract_metrics(
         "MOTA": _pct(clear_fam, "CLEAR", "MOTA"),
         "IDF1": _pct(id_fam, "Identity", "IDF1"),
     }
+
+
+def extract_all_metrics(
+    result: dict,
+    *,
+    tracker_name: str,
+    class_name: str = _DEFAULT_CLASS,
+) -> "Dict[str, Dict[str, float]]":
+    """Return EVERY metric TrackEval computed, organised by family.
+
+    Unlike :func:`extract_metrics` (the 5 headline values), this dumps all fields
+    of all families (``HOTA``, ``CLEAR``, ``Identity``, ``Count``) for writing to
+    ``metrics.json``. Formatting matches TrackEval's printed table:
+
+    * float / rate fields  -> percentages (``value * 100``),
+    * integer / count fields (see :data:`_INTEGER_FIELDS`) -> raw ints,
+    * per-alpha float arrays (HOTA family) -> their mean, then ``* 100``.
+
+    Integer-array fields (``HOTA_TP``/``FN``/``FP``) and private ``_``-keys are
+    omitted, mirroring TrackEval's summary. Non-numeric values are skipped.
+
+    Returns ``{family_name: {metric_name: float}}``.
+    """
+    metrics_raw = _combined_seq_class(result, tracker_name, class_name)
+    out: "Dict[str, Dict[str, float]]" = {}
+    for family, fields in metrics_raw.items():
+        if not isinstance(fields, dict):
+            continue
+        int_fields = _INTEGER_FIELDS.get(family, set())
+        skip = _SKIP_FIELDS.get(family, set())
+        fam_out: "Dict[str, float]" = {}
+        for key, val in fields.items():
+            if str(key).startswith("_") or key in skip:
+                continue
+            try:
+                arr = np.asarray(val, dtype=float)
+            except (TypeError, ValueError):
+                continue  # non-numeric (e.g. stray strings) — skip
+            if arr.ndim >= 1:
+                fam_out[key] = float(np.mean(arr)) * 100.0
+            elif key in int_fields:
+                fam_out[key] = int(round(float(arr)))
+            else:
+                fam_out[key] = float(arr) * 100.0
+        out[family] = fam_out
+    return out

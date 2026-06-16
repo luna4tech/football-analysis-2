@@ -51,6 +51,7 @@ from eval.gt_adapters import (
     register_gt_loader,
 )
 from eval.trackeval_runner import (
+    extract_all_metrics,
     extract_metrics,
     materialize_layout,
     parse_trackeval_output,
@@ -589,11 +590,31 @@ def _fake_result(
         "DetA": np.full(alpha_count, det_a / 100.0),
         "AssA": np.full(alpha_count, ass_a / 100.0),
         "LocA": np.full(alpha_count, 0.88),
+        "HOTA(0)": 0.8555,  # scalar float -> x100
+        "HOTA_TP": np.full(alpha_count, 95000.0),  # integer array -> must be SKIPPED
         # Extra key TrackEval emits — must be tolerated.
         "_extra": "ignore me",
     }
-    clear_family = {"MOTA": mota / 100.0, "MOTP": 0.75, "IDSW": 124, "Frag": 1578}
-    identity_family = {"IDF1": idf1 / 100.0, "IDR": 0.86, "IDP": 0.76}
+    clear_family = {
+        "MOTA": mota / 100.0,
+        "MOTP": 0.75,
+        "IDSW": 124,
+        "Frag": 1578,
+        "CLR_TP": 91642,
+        "CLR_FN": 11276,
+        "CLR_FP": 25106,
+        "MT": 23,
+        "PT": 1,
+        "ML": 1,
+    }
+    identity_family = {
+        "IDF1": idf1 / 100.0,
+        "IDR": 0.86,
+        "IDP": 0.76,
+        "IDTP": 89059,
+        "IDFN": 13859,
+        "IDFP": 27689,
+    }
     count_family = {"Dets": 116748, "GT_Dets": 102918, "IDs": 64, "GT_IDs": 25}
     per_class = {
         "HOTA": hota_family,
@@ -660,6 +681,35 @@ def test_extract_metrics_custom_class():
     assert abs(m["HOTA"] - 72.345) < 1e-6
 
 
+def test_extract_all_metrics_full():
+    """All families dumped; rates x100, counts raw int, arrays meaned, int-arrays skipped."""
+    result = _fake_result()
+    allm = extract_all_metrics(result, tracker_name="refined")
+    assert set(allm) == {"HOTA", "CLEAR", "Identity", "Count"}, allm
+
+    hota = allm["HOTA"]
+    assert abs(hota["HOTA"] - 72.345) < 1e-6  # array mean x100
+    assert abs(hota["DetA"] - 68.1) < 1e-6
+    assert abs(hota["LocA"] - 88.0) < 1e-6
+    assert abs(hota["HOTA(0)"] - 85.55) < 1e-6  # scalar float x100
+    assert "HOTA_TP" not in hota, "integer-array field must be skipped"
+    assert "_extra" not in hota, "private/non-numeric field must be skipped"
+
+    clear = allm["CLEAR"]
+    assert abs(clear["MOTA"] - 65.5) < 1e-6  # float x100
+    assert abs(clear["MOTP"] - 75.0) < 1e-6
+    assert clear["IDSW"] == 124 and isinstance(clear["IDSW"], int)  # count: raw int
+    assert clear["CLR_FP"] == 25106 and clear["MT"] == 23 and clear["Frag"] == 1578
+
+    ident = allm["Identity"]
+    assert abs(ident["IDF1"] - 81.25) < 1e-6
+    assert ident["IDTP"] == 89059 and isinstance(ident["IDTP"], int)
+
+    cnt = allm["Count"]
+    assert cnt["Dets"] == 116748 and cnt["GT_IDs"] == 25
+    assert all(isinstance(v, int) for v in cnt.values())
+
+
 # ---------------------------------------------------------------------------
 # 7. format_metrics_table (Task E2)
 # ---------------------------------------------------------------------------
@@ -706,6 +756,29 @@ def test_write_metrics_json_creates_parents():
         out = Path(tmp) / "deep" / "nested" / "metrics.json"
         write_metrics_json(out, "S", "refined", {"HOTA": 1.0, "DetA": 1.0, "AssA": 1.0, "MOTA": 1.0, "IDF1": 1.0})
         assert out.is_file()
+
+
+def test_write_metrics_json_includes_all_metrics():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "metrics.json"
+        metrics = {"HOTA": 60.9, "DetA": 54.9, "AssA": 67.6, "MOTA": 64.5, "IDF1": 81.1}
+        allm = extract_all_metrics(_fake_result(), tracker_name="refined")
+        write_metrics_json(out, "M59", "refined", metrics, all_metrics=allm)
+        import json
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert set(data["metrics"]) == {"HOTA", "DetA", "AssA", "MOTA", "IDF1"}
+        assert set(data["all_metrics"]) == {"HOTA", "CLEAR", "Identity", "Count"}
+        assert data["all_metrics"]["CLEAR"]["IDSW"] == 124
+        assert data["all_metrics"]["Count"]["GT_IDs"] == 25
+
+
+def test_write_metrics_json_omits_all_metrics_when_absent():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "metrics.json"
+        write_metrics_json(out, "S", "refined", {"HOTA": 1.0})
+        import json
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert "all_metrics" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -813,10 +886,13 @@ _TESTS = [
     ("E2 extract_metrics: wrong tracker raises KeyError", test_extract_metrics_wrong_tracker_raises),
     ("E2 extract_metrics: missing metric raises KeyError", test_extract_metrics_missing_metric_raises),
     ("E2 extract_metrics: custom class_name", test_extract_metrics_custom_class),
+    ("extract_all_metrics: full per-family dump", test_extract_all_metrics_full),
     ("E2 format_table: 5 keys + values present", test_format_metrics_table_structure),
     ("E2 format_table: missing key shows N/A", test_format_metrics_table_missing_key_shows_na),
     ("E2 metrics.json: schema correct", test_write_metrics_json_schema),
     ("E2 metrics.json: creates parent dirs", test_write_metrics_json_creates_parents),
+    ("metrics.json: includes all_metrics block", test_write_metrics_json_includes_all_metrics),
+    ("metrics.json: omits all_metrics when absent", test_write_metrics_json_omits_all_metrics_when_absent),
     ("E2 run_evaluation: stub runner writes metrics.json", test_run_evaluation_injected_stub_writes_metrics_json),
     ("E2 run_evaluation: stub does not import trackeval", test_run_evaluation_stub_no_trackeval_imported),
 ]
