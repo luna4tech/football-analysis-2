@@ -97,39 +97,36 @@ bundled torchreid that Stage 1's ReID needs), then add the two libraries it does
 %cd $REPO
 !pip install -q -r gta-link/requirements.txt
 !pip install -q cython_bbox tqdm
+!pip install -q -e Deep-EIoU/Deep-EIoU/reid
 ```
 
-> **You do NOT need to run the READMEs' build steps.** The `yolox` and `reid` packages are used
-> **in place**, so:
-> - Deep-EIoU's `python setup.py develop` is skipped — it only compiles `yolox._C`, which is used
->   solely by the COCO mAP evaluator, not by detection/tracking (NMS uses torchvision).
-> - `reid/setup.py develop` is skipped — it only builds an optional Cython ranking metric that has
->   a Python fallback; `FeatureExtractor` doesn't use it.
-> - GtaLink's separate `pip install torchreid` is skipped — see the box below.
+> The last line installs the **vendored** `reid` package (Deep-EIoU's bundled torchreid) — this is
+> the Deep-EIoU README's `cd reid && python setup.py develop` step, done the modern `pip install -e`
+> way (so it avoids the `setuptools<60` caveat the gta-link README mentions). It is required:
+> Stage 1's ReID self-imports by absolute name (`from torchreid import …`), so the vendored copy
+> must be registered as the top-level `torchreid`.
 >
-> `requirements.txt` also pulls a few training/dev-only packages (`tb-nightly`, `flake8`, `yapf`)
-> the pipeline doesn't use — harmless, just slower to install. If `pip install cython_bbox` ever
-> fails to build, run `!pip install -q cython` first and retry.
+> **Do NOT `pip install torchreid` from PyPI** — the current PyPI release uses a `torchreid.reid.*`
+> layout that is incompatible with the vendored code's `torchreid.utils` imports (you'll get
+> `ModuleNotFoundError: No module named 'torchreid.utils'`).
+>
+> You do **not** need Deep-EIoU's *other* `setup.py` (the top-level `yolox` one) — it only compiles
+> `yolox._C`, used solely by the COCO mAP evaluator, not by detection/tracking. `requirements.txt`
+> also pulls a few training/dev-only packages (`tb-nightly`, `flake8`, `yapf`) the pipeline doesn't
+> use — harmless, just slower. If `pip install cython_bbox` ever fails to build, run
+> `!pip install -q cython` first and retry.
 
-#### One environment, two working directories — where `reid` comes from
+#### One environment, two working directories
 
-Everything here runs in **one Colab environment**: you `pip install` once (above) and that single
-set of packages serves both stages. The stages are not separate environments — the *only* thing
-that differs between them is the **working directory**, which the orchestrator
-(`python -m pipeline run`) sets per stage when it launches each as a subprocess:
+Everything runs in **one Colab environment** — you `pip install` once (above) and that single set of
+packages serves both stages. The stages are not separate environments; the *only* thing that differs
+is the **working directory**, which the orchestrator (`python -m pipeline run`) sets per stage when
+it launches each as a subprocess:
 
-| Stage | Working dir | ReID / `reid` source |
-|-------|-------------|----------------------|
-| 1 (track) | `Deep-EIoU/Deep-EIoU` | `from reid.torchreid.utils import FeatureExtractor` → the **bundled** `Deep-EIoU/Deep-EIoU/reid/` copy, used **in place** (never pip-installed) |
-| 2 (refine) | `gta-link` | does **not** import `reid`/`torchreid` at all — it reuses Stage 1's cached embeddings |
-
-So **`reid` is not installed from anywhere** — it's the in-repo folder, found because Stage 1's CWD
-is `Deep-EIoU/Deep-EIoU`. Do **not** `pip install torchreid`: it would add an unused `torchreid` to
-the env, and Stage 1 imports `reid.torchreid` (namespaced under `reid`), not the bare `torchreid`
-that pip provides — so it wouldn't be used anyway. (The two bundled torchreid copies under
-`Deep-EIoU/.../reid/` and `gta-link/reid/` never clash because only Stage 1 imports one of them, and
-only from its own CWD.) The libraries `requirements.txt` installed are simply the leaf dependencies
-that bundled `reid` needs at import time.
+| Stage | Working dir | ReID |
+|-------|-------------|------|
+| 1 (track) | `Deep-EIoU/Deep-EIoU` | `from reid.torchreid.utils import FeatureExtractor` → the vendored `Deep-EIoU/Deep-EIoU/reid/` package installed editable above (so top-level `torchreid` resolves to it) |
+| 2 (refine) | `gta-link` | does **not** import `reid`/`torchreid` — it reuses Stage 1's cached embeddings |
 
 ### 4. Fetch the checkpoints (once, to Drive) and link them into place
 Downloads the two model files from the public Drive folder into your Drive `checkpoints/` folder
