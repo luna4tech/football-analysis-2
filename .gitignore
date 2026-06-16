@@ -34,3 +34,6 @@ Thumbs.db
 
 # Claude Code local-only settings (keep skills tracked, ignore machine-local prefs)
 .claude/settings.local.json
+
+# Local sample data (videos + GT), never committed
+test-data/
