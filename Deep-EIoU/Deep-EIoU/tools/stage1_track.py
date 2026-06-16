@@ -43,6 +43,19 @@ import cv2
 import torch
 from loguru import logger
 
+# --- torch.load compatibility shim ------------------------------------------
+# PyTorch >= 2.6 flipped torch.load(weights_only) to default True, which rejects
+# the numpy globals stored in the trusted OSNet/YOLOX checkpoints (e.g.
+# numpy.core.multiarray.scalar -> UnpicklingError "Weights only load failed").
+# The vendored torchreid's load_checkpoint calls torch.load without this kwarg,
+# so restore the legacy weights_only=False default here rather than editing
+# vendored code. Affects only this Stage 1 process; the checkpoints are local.
+_orig_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
+
 # --- import path setup ------------------------------------------------------
 # CWD is Deep-EIoU/Deep-EIoU (demo.py does sys.path.append('.')); mirror that so
 # `tracker`, `yolox`, `reid`, and sibling `tools` modules import.
