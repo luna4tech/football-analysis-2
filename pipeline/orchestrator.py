@@ -71,6 +71,12 @@ class RunOptions:
     batch_size : int
         Frames per batch in parallel mode (forwarded as ``--batch-size`` only
         when ``parallel`` is set).
+    fp16 : bool
+        Half-precision detector inference (forwarded as ``--fp16``).  This is the
+        main GPU throughput lever — batching does NOT speed up an already
+        compute-saturated detector, but FP16 typically gives ~1.5-2x.
+    fuse : bool
+        Fuse detector conv+BN layers (forwarded as ``--fuse``); small free gain.
 
     Stage 2 refine params (forwarded with the same names Stage 2 declares)
     ---------------------------------------------------------------------
@@ -98,6 +104,8 @@ class RunOptions:
         device: str = "gpu",
         parallel: bool = False,
         batch_size: int = 8,
+        fp16: bool = False,
+        fuse: bool = False,
         use_split: bool = True,
         use_connect: bool = True,
         eps: float = 0.6,
@@ -113,6 +121,8 @@ class RunOptions:
         self.device = device
         self.parallel = parallel
         self.batch_size = batch_size
+        self.fp16 = fp16
+        self.fuse = fuse
         self.use_split = use_split
         self.use_connect = use_connect
         self.eps = eps
@@ -157,8 +167,9 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
     """Build the Stage-1 argv (to run with ``cwd=STAGE1_CWD``).
 
     Always passes the absolute ``--video`` / ``--artifacts-dir``.  Forwards
-    ``--device`` always; ``--parallel --batch-size N`` only when parallel; and
-    ``--force`` only when Stage 1 is forced.
+    ``--device`` always; ``--parallel --batch-size N`` only when parallel;
+    ``--fp16`` / ``--fuse`` only when enabled; and ``--force`` only when Stage 1
+    is forced.
     """
     cmd: List[str] = [
         sys.executable,
@@ -169,6 +180,10 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
     ]
     if opts.parallel:
         cmd += ["--parallel", "--batch-size", str(opts.batch_size)]
+    if opts.fp16:
+        cmd += ["--fp16"]
+    if opts.fuse:
+        cmd += ["--fuse"]
     if opts.force_stage1:
         cmd += ["--force"]
     return cmd

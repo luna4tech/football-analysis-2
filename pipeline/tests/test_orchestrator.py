@@ -125,6 +125,19 @@ def test_stage1_force_adds_force():
     assert "--force" in cmd, cmd
 
 
+def test_stage1_fp16_and_fuse_off_by_default():
+    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", RunOptions())
+    assert "--fp16" not in cmd, cmd
+    assert "--fuse" not in cmd, cmd
+
+
+def test_stage1_fp16_and_fuse_forwarded():
+    opts = RunOptions(fp16=True, fuse=True)
+    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
+    assert "--fp16" in cmd, cmd
+    assert "--fuse" in cmd, cmd
+
+
 # ===========================================================================
 # Stage-2 command wiring
 # ===========================================================================

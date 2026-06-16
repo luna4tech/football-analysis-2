@@ -89,6 +89,19 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         default=8,
         help="frames per batch in --parallel mode",
     )
+    g1.add_argument(
+        "--fp16",
+        action="store_true",
+        default=False,
+        help="half-precision detector inference (big speedup on GPU; the main "
+        "throughput lever — batching does NOT help a saturated detector)",
+    )
+    g1.add_argument(
+        "--fuse",
+        action="store_true",
+        default=False,
+        help="fuse conv+BN in the detector (small free speedup)",
+    )
 
     # --- Stage 2 ---
     g2 = p.add_argument_group("Stage 2 (refine)")
@@ -156,6 +169,8 @@ def _run_from_args(args: argparse.Namespace) -> int:
         device=args.device,
         parallel=args.parallel,
         batch_size=args.batch_size,
+        fp16=args.fp16,
+        fuse=args.fuse,
         use_split=args.use_split,
         use_connect=args.use_connect,
         eps=args.eps,

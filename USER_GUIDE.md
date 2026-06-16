@@ -84,8 +84,12 @@ Common options:
 # Choose where artifacts land (default: <repo>/artifacts)
 python -m pipeline run --video clip.mp4 --artifacts-dir /content/artifacts
 
-# Stage-1 throughput mode (batched detect+ReID + prefetch decode)
-python -m pipeline run --video clip.mp4 --parallel --batch-size 16
+# Stage-1 throughput: --fp16 is the main lever (~1.5-2x on GPU). See §8.
+python -m pipeline run --video clip.mp4 --fp16 --fuse
+
+# --parallel adds decode/compute overlap (small extra gain; NOT a substitute
+# for --fp16 — batching alone does not speed up the saturated detector).
+python -m pipeline run --video clip.mp4 --fp16 --parallel --batch-size 16
 
 # Drop one refine component (at least one must remain)
 python -m pipeline run --video clip.mp4 --no-split      # connect/merge only
@@ -112,10 +116,10 @@ cd Deep-EIoU/Deep-EIoU
 python tools/stage1_track.py \
     --video /abs/path/clip.mp4 \
     --artifacts-dir /abs/path/artifacts \
-    --device gpu
-# parallel variant:
+    --device gpu --fp16          # --fp16 = main throughput lever (see §8)
+# parallel variant (decode/compute overlap on top of --fp16):
 python tools/stage1_track.py --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/artifacts --parallel --batch-size 16
+    --artifacts-dir /abs/path/artifacts --fp16 --parallel --batch-size 16
 ```
 
 **Stage 2 (refine)** — CWD `gta-link`:
@@ -252,7 +256,25 @@ GPU peak). Use the `io` block to compare a sequential vs a parallel run (same
 
 ---
 
-## 8. When to use parallelization
+## 8. Throughput: `--fp16` first, then parallelization
+
+### 8a. `--fp16` is the main throughput lever
+
+The Stage-1 detector (YOLOX-x, ~99M params / ~793 GFLOPs **per frame**) is the
+bottleneck, and at this input size it **saturates the GPU at batch size 1**.
+Half-precision inference is the single biggest win:
+
+```bash
+python -m pipeline run --video clip.mp4 --device gpu --fp16
+# combine with --fuse (fuses conv+BN; small free gain):
+python -m pipeline run --video clip.mp4 --device gpu --fp16 --fuse
+```
+
+On a modern GPU (T4/A100) `--fp16` typically gives **~1.5–2× Stage-1 throughput**
+and roughly halves activation memory, with no meaningful accuracy change for
+inference. Try this **before** reaching for `--parallel`.
+
+### 8b. What `--parallel` actually buys (and what it doesn't)
 
 Stage 1 has two paths producing the **same artifact contract**:
 
@@ -261,16 +283,27 @@ Stage 1 has two paths producing the **same artifact contract**:
   while detection + ReID run **batched** on the GPU; the tracker still consumes
   frames in strict order.
 
-**Use `--parallel` when** you want **throughput** on a longer clip and have a GPU
-with VRAM to spare. The win comes from (a) overlapping CPU video-decode with GPU
-compute and (b) better GPU utilization from batched detect+ReID. Larger
-`--batch-size` → more overlap and higher GPU utilization, **up to your VRAM
-limit**.
+**Important — batching does NOT speed up a compute-saturated detector.** Because
+one frame already maxes out the GPU's compute, batching N frames runs the same
+total FLOPs with no idle time to fill: throughput stays flat while VRAM grows
+~N×. Measured on a 901-frame clip (T4), `--parallel --batch-size 16` was only
+**~5% faster** than sequential — and that entire gain came from the prefetch
+thread **overlapping video-decode with GPU compute**, *not* from batching.
+
+> The "fps" printed in parallel mode counts only the cheap CPU tracking step, not
+> the GPU work — it is **not** the pipeline rate. Judge speed by the
+> **Stage 1 wall** line at the end of the run.
+
+**Use `--parallel` when** decode is a non-trivial share of wall time (high-res or
+high-fps source, fast GPU) and you have VRAM to spare. The realistic win is the
+decode overlap (single-digit %), not batched compute. If you want raw speed,
+`--fp16` dwarfs it.
 
 **Choosing `--batch-size` against VRAM:** batch memory scales roughly linearly
-with batch size. Start at `8`, raise toward `16–32` while watching `gpu_peak_mb`
-in the profile and `nvidia-smi`; if you hit OOM, halve it. Very large batches add
-latency-to-first-output without extra throughput once the GPU saturates.
+with batch size. Start at `8`, raise toward `16` only while watching
+`gpu_peak_mb` in the profile and `nvidia-smi`; if you hit OOM, halve it. Going
+past the point where decode is fully hidden adds latency-to-first-output and VRAM
+with **no** throughput gain.
 
 **Prefer sequential when:**
 - **debugging** — simplest control flow, deterministic ordering, easiest to read.
