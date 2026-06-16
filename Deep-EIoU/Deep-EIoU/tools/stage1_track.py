@@ -100,8 +100,8 @@ from demo import (  # noqa: F401  (Predictor used)
 
 from stage1_assembly import (
     TrackletAssembler,
-    batched_consume_loop,
     load_tracklet_class,
+    pipelined_consume_loop,
     split_by_counts,
 )
 
@@ -429,16 +429,18 @@ def _iter_prefetched_frames(path, batch_size):
 # Parallel stage driver
 # ---------------------------------------------------------------------------
 #
-# The strict-order batch/consume loop (`batched_consume_loop`) lives in the
-# pure-Python `stage1_assembly` module so it can be unit-tested on a CPU-only
-# box with stub perceive/consume callables (no torch/cv2/yolox).
+# The strict-order loops (`batched_consume_loop`, `pipelined_consume_loop`) live
+# in the pure-Python `stage1_assembly` module so they can be unit-tested on a
+# CPU-only box with stub perceive/consume callables (no torch/cv2/yolox).
 def run_stage1_parallel(predictor, extractor, args, paths):
     """Parallel perceive -> track -> assemble over the video (opt-in).
 
     Same artifact contract as ``run_stage1``: writes ``tracks.txt`` and
-    ``tracklets.pkl`` and returns the same IO-count dict.  Overlaps video decode
-    (background prefetch thread) with batched detection + batched ReID, then
-    feeds the UNCHANGED ``track_consume`` in strict frame order.
+    ``tracklets.pkl`` and returns the same IO-count dict.  Three-stage overlap:
+    a prefetch thread decodes frames, a producer thread runs batched detection +
+    batched ReID on the GPU, and the calling thread feeds the UNCHANGED
+    ``track_consume`` in strict frame order — so the GPU computes the next batch
+    while the tracker processes the current one (``pipelined_consume_loop``).
     """
     Tracklet = load_tracklet_class(_GTA_LINK_DIR)
     assembler = TrackletAssembler(Tracklet)
@@ -471,7 +473,9 @@ def run_stage1_parallel(predictor, extractor, args, paths):
         timer.toc()
 
     frame_source = _iter_prefetched_frames(args.path, args.batch_size)
-    n_frames = batched_consume_loop(
+    # Overlap GPU perceive (producer thread) with CPU consume (this thread) so
+    # the detector computes batch N+1 while the tracker drains batch N.
+    n_frames = pipelined_consume_loop(
         frame_source, args.batch_size, _perceive, _consume
     )
 

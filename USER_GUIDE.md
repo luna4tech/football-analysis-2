@@ -278,32 +278,41 @@ inference. Try this **before** reaching for `--parallel`.
 
 Stage 1 has two paths producing the **same artifact contract**:
 
-- **sequential** (default): one frame at a time — decode → detect → ReID → track.
-- **`--parallel --batch-size N`**: a background thread prefetches/decodes frames
-  while detection + ReID run **batched** on the GPU; the tracker still consumes
-  frames in strict order.
+- **sequential** (default): one frame at a time — decode → detect → ReID → track,
+  all on one thread.
+- **`--parallel --batch-size N`**: a **3-stage pipeline** — a prefetch thread
+  decodes frames, a producer thread runs **batched** detect+ReID on the GPU, and
+  the calling thread runs the tracker in strict frame order. So the GPU computes
+  batch *N+1* while the tracker drains batch *N* (decode ∥ GPU ∥ track).
 
-**Important — batching does NOT speed up a compute-saturated detector.** Because
-one frame already maxes out the GPU's compute, batching N frames runs the same
-total FLOPs with no idle time to fill: throughput stays flat while VRAM grows
-~N×. Measured on a 901-frame clip (T4), `--parallel --batch-size 16` was only
-**~5% faster** than sequential — and that entire gain came from the prefetch
-thread **overlapping video-decode with GPU compute**, *not* from batching.
+**What it does NOT do — batching does not speed up a compute-saturated detector.**
+Because one frame already maxes out the GPU's compute, batching N frames runs the
+same total FLOPs with no idle time to fill: throughput stays flat while VRAM
+grows ~N×. The pipeline's win is **overlap**, not batching — it hides the
+per-frame CPU tail (decode + tracking + postprocess) behind GPU compute instead
+of running it serially.
+
+How big is that overlap win? It equals the share of wall time spent **off** the
+GPU. On a T4 in FP32 the detector dominates (GPU ~80% busy), so there is only
+~20% tail to hide and the early measured gain was small (~5%). **Under `--fp16`
+the detector gets ~2× cheaper but the CPU tail does not, so the tail becomes a
+much larger share — and the pipeline overlap matters more.** Rule of thumb:
+the lower your `sm%` during a run, the more `--parallel` buys you.
 
 > The "fps" printed in parallel mode counts only the cheap CPU tracking step, not
 > the GPU work — it is **not** the pipeline rate. Judge speed by the
 > **Stage 1 wall** line at the end of the run.
 
-**Use `--parallel` when** decode is a non-trivial share of wall time (high-res or
-high-fps source, fast GPU) and you have VRAM to spare. The realistic win is the
-decode overlap (single-digit %), not batched compute. If you want raw speed,
-`--fp16` dwarfs it.
+**Use `--parallel` when** there is a non-trivial off-GPU tail to hide — i.e.
+`sm%` is well under 100 (you're running `--fp16`, a fast GPU, high-res decode,
+or heavy tracking) and you have VRAM to spare. If `sm%` is pinned near 100,
+the GPU is the wall and overlap has nothing to reclaim; reach for `--fp16` first.
 
 **Choosing `--batch-size` against VRAM:** batch memory scales roughly linearly
 with batch size. Start at `8`, raise toward `16` only while watching
-`gpu_peak_mb` in the profile and `nvidia-smi`; if you hit OOM, halve it. Going
-past the point where decode is fully hidden adds latency-to-first-output and VRAM
-with **no** throughput gain.
+`gpu_peak_mb` in the profile and `nvidia-smi`; if you hit OOM, halve it. Batches
+larger than what keeps the GPU continuously fed add latency-to-first-output and
+VRAM with **no** throughput gain.
 
 **Prefer sequential when:**
 - **debugging** — simplest control flow, deterministic ordering, easiest to read.

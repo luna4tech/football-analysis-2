@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,7 @@ def _load_assembly():
 _asm = _load_assembly()
 split_by_counts = _asm.split_by_counts
 batched_consume_loop = _asm.batched_consume_loop
+pipelined_consume_loop = _asm.pipelined_consume_loop
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +266,116 @@ def test_ordering_empty_stream():
     assert received == []
 
 
+# ===========================================================================
+# 3. pipelined_consume_loop — same ordering contract, but perceive runs on a
+#    producer thread concurrently with consume.
+# ===========================================================================
+def _run_ordering_pipelined(n_frames, batch_size, none_frames, queue_depth=2):
+    """Drive pipelined_consume_loop and record consumer calls (in call order)."""
+    received = []
+
+    def _consume(frame_id, det, embs):
+        received.append((frame_id, det is None))
+
+    frame_source = ((i, i) for i in range(n_frames))
+    stub = _make_stub_perceive(none_frames)
+    total = pipelined_consume_loop(
+        frame_source, batch_size, stub, _consume, queue_depth=queue_depth
+    )
+    return total, received
+
+
+def test_pipelined_matches_serial_ordering():
+    # For a spread of scenarios, the pipelined loop must deliver the EXACT same
+    # consumer call sequence (frame_id, is_none) as the serial batch loop.
+    scenarios = [
+        (12, 4, set()),
+        (10, 4, set()),
+        (14, 3, {0, 3, 4, 9, 13}),
+        (5, 1, {2}),
+        (3, 8, set()),
+        (0, 4, set()),
+    ]
+    for n, bs, none in scenarios:
+        _, serial = _run_ordering(n, bs, none_frames=none)
+        total_p, pipelined = _run_ordering_pipelined(n, bs, none_frames=none)
+        assert pipelined == serial, (
+            f"pipelined != serial for n={n} bs={bs} none={none}: "
+            f"{pipelined} != {serial}"
+        )
+        assert total_p == n, (n, total_p)
+
+
+def test_pipelined_strict_order_with_queue_depth_one():
+    # queue_depth=1 still preserves strict 0..N-1 order (single producer, FIFO).
+    total, received = _run_ordering_pipelined(11, 3, none_frames={1, 6}, queue_depth=1)
+    ids = [fid for fid, _ in received]
+    assert ids == list(range(11)), ids
+    assert total == 11
+    none_received = {fid for fid, is_none in received if is_none}
+    assert none_received == {1, 6}, none_received
+
+
+def test_pipelined_producer_exception_propagates():
+    # A perceive failure on the producer thread must re-raise on the caller
+    # thread (not hang, not swallow).
+    class _Boom(RuntimeError):
+        pass
+
+    def _bad_perceive(frames):
+        if 5 in frames:          # blow up only on the batch containing frame 5
+            raise _Boom("perceive failed")
+        return [(np.zeros((1, 4), np.float32), np.zeros((1, 4), np.float32)) for _ in frames]
+
+    def _consume(frame_id, det, embs):
+        pass
+
+    frame_source = ((i, i) for i in range(8))
+    raised = False
+    try:
+        pipelined_consume_loop(frame_source, 3, _bad_perceive, _consume)
+    except _Boom:
+        raised = True
+    assert raised, "producer-thread exception must propagate to the caller"
+
+
+def test_pipelined_perceive_and_consume_overlap():
+    # Deterministic proof of concurrency: consume(frame 0) blocks until the
+    # producer has begun perceiving the SECOND batch.  This can only complete if
+    # perceive runs on a thread distinct from consume — a serial loop (perceive
+    # then consume on one thread) would deadlock, which we detect via timeout.
+    perceived_second_batch = threading.Event()
+
+    def _perceive(frames):
+        if 2 in frames:                         # the second batch ([2, 3])
+            perceived_second_batch.set()
+        return [(np.zeros((1, 4), np.float32), np.zeros((1, 4), np.float32)) for _ in frames]
+
+    consumed = []
+
+    def _consume(frame_id, det, embs):
+        if frame_id == 0:
+            # Will only be set if the producer thread ran ahead to batch 2.
+            assert perceived_second_batch.wait(timeout=5.0), (
+                "perceive of batch 2 did not run while consuming frame 0 "
+                "-> no overlap (serialized)"
+            )
+        consumed.append(frame_id)
+
+    box = {}
+
+    def _drive():
+        frame_source = ((i, i) for i in range(4))  # 2 batches of 2
+        box["n"] = pipelined_consume_loop(frame_source, 2, _perceive, _consume, queue_depth=2)
+
+    t = threading.Thread(target=_drive)
+    t.start()
+    t.join(timeout=10.0)
+    assert not t.is_alive(), "pipelined loop deadlocked (perceive/consume not concurrent)"
+    assert consumed == [0, 1, 2, 3], consumed
+    assert box.get("n") == 4, box
+
+
 _TESTS = [
     ("split_by_counts: basic per-frame split + zero-count empty", test_split_basic_per_frame),
     ("split_by_counts: None passthrough, rows conserved", test_split_none_passthrough),
@@ -278,6 +390,10 @@ _TESTS = [
     ("ordering: batch_size == 1", test_ordering_batch_size_one),
     ("ordering: batch larger than stream", test_ordering_batch_larger_than_stream),
     ("ordering: empty stream", test_ordering_empty_stream),
+    ("pipelined: matches serial consume order across scenarios", test_pipelined_matches_serial_ordering),
+    ("pipelined: strict order with queue_depth=1", test_pipelined_strict_order_with_queue_depth_one),
+    ("pipelined: producer exception propagates to caller", test_pipelined_producer_exception_propagates),
+    ("pipelined: perceive overlaps consume (concurrency proof)", test_pipelined_perceive_and_consume_overlap),
 ]
 
 

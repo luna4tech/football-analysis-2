@@ -23,7 +23,9 @@ module performs no cross-frame inference of its own.
 from __future__ import annotations
 
 import importlib.util
+import queue
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
 
@@ -305,5 +307,120 @@ def batched_consume_loop(
     # Final partial batch.
     if batch_frames:
         _flush()
+
+    return n_frames
+
+
+# ---------------------------------------------------------------------------
+# Pipelined batch/consume loop (overlaps GPU perceive with CPU consume)
+# ---------------------------------------------------------------------------
+# A drop-in replacement for ``batched_consume_loop`` that runs
+# ``perceive_batch_fn`` on a SEPARATE producer thread, so the GPU can compute
+# batch N+1 while the (strictly ordered, stateful) consumer processes batch N on
+# the calling thread.  This reclaims the per-frame CPU tail — tracking,
+# postprocess, host<->device copies — that the serial loop leaves the GPU idle
+# for.  The win grows as the detector gets cheaper (e.g. under ``--fp16``), when
+# that tail becomes a larger share of wall time.
+#
+# Correctness is identical to ``batched_consume_loop``:
+#   * exactly ONE producer thread iterates ``frame_source`` in order and pushes
+#     per-batch results FIFO, so batches arrive in strict frame order;
+#   * ``consume_fn`` runs only on the CALLING thread and is invoked for
+#     ``frame_id`` 0, 1, 2, ... exactly once each, in order;
+#   * the producer touches only the GPU model/extractor (via
+#     ``perceive_batch_fn``) and the consumer touches only the tracker (via
+#     ``consume_fn``), so there is no shared mutable state between threads.
+# Only the *timing* of perceive relative to consume changes, so the emitted
+# artifacts are byte-identical to the serial parallel path (up to the same
+# floating-point nondeterminism batched GPU kernels already introduce).
+_PIPELINE_SENTINEL = object()  # producer pushes this once when the stream ends
+
+
+def pipelined_consume_loop(
+    frame_source: Iterable[Tuple[int, Any]],
+    batch_size: int,
+    perceive_batch_fn: Callable[[List[Any]], Sequence[Tuple[Any, Any]]],
+    consume_fn: Callable[[int, Any, Any], None],
+    queue_depth: int = 2,
+) -> int:
+    """Like :func:`batched_consume_loop`, but overlaps perceive with consume.
+
+    Parameters
+    ----------
+    frame_source, batch_size, perceive_batch_fn, consume_fn:
+        Same contract as :func:`batched_consume_loop`.
+    queue_depth:
+        Max number of *completed* batches the producer may queue ahead of the
+        consumer (bounds memory).  ``2`` lets the producer compute the next batch
+        while the consumer drains the current one without running unboundedly
+        ahead.
+
+    Returns
+    -------
+    int
+        The number of frames processed (``N``).
+
+    Notes
+    -----
+    A producer-thread exception is re-raised on the calling thread after the
+    queue drains, so failures in detection/ReID surface loudly instead of
+    hanging.  Pure-Python (``threading`` + ``queue``); no torch/cv2 import, so it
+    is unit-testable on a CPU-only box with stub callables.
+    """
+    maxsize = max(1, queue_depth)
+    results_q: "queue.Queue" = queue.Queue(maxsize=maxsize)
+    error_box: List[BaseException] = []
+
+    def _producer() -> None:
+        batch_ids: List[int] = []
+        batch_frames: List[Any] = []
+
+        def _emit() -> None:
+            results = perceive_batch_fn(batch_frames)
+            # Copy ids/results so the next batch can reuse the working lists.
+            results_q.put((list(batch_ids), list(results)))
+            batch_ids.clear()
+            batch_frames.clear()
+
+        try:
+            for frame_id, frame in frame_source:
+                batch_ids.append(frame_id)
+                batch_frames.append(frame)
+                if len(batch_frames) == batch_size:
+                    _emit()
+            if batch_frames:  # final partial batch
+                _emit()
+        except BaseException as exc:  # noqa: BLE001 - surfaced to caller thread
+            error_box.append(exc)
+        finally:
+            # Always signal end-of-stream so the consumer never blocks forever.
+            results_q.put(_PIPELINE_SENTINEL)
+
+    worker = threading.Thread(target=_producer, name="stage1-perceive", daemon=True)
+    worker.start()
+
+    n_frames = 0
+    try:
+        while True:
+            item = results_q.get()
+            if item is _PIPELINE_SENTINEL:
+                break
+            batch_ids, results = item
+            for fid, (det, embs) in zip(batch_ids, results):
+                consume_fn(fid, det, embs)
+                n_frames += 1
+    finally:
+        # If the consumer stopped early (e.g. consume_fn raised), the producer
+        # may be blocked on a full queue.  Drain so it can reach its sentinel,
+        # then join with a timeout so we never hang forever.
+        try:
+            while results_q.get_nowait() is not _PIPELINE_SENTINEL:
+                pass
+        except queue.Empty:
+            pass
+        worker.join(timeout=5.0)
+
+    if error_box:
+        raise error_box[0]
 
     return n_frames
