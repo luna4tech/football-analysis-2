@@ -369,6 +369,8 @@ _TESTS = [
     ("stage1 sequential command shape", test_stage1_sequential_command),
     ("stage1 --parallel forwards --batch-size", test_stage1_parallel_forwards_batch),
     ("stage1 force adds --force", test_stage1_force_adds_force),
+    ("stage1 --fp16/--fuse off by default", test_stage1_fp16_and_fuse_off_by_default),
+    ("stage1 --fp16/--fuse forwarded", test_stage1_fp16_and_fuse_forwarded),
     ("stage2 refine params forwarded", test_stage2_refine_params_forwarded),
     ("stage2 no-split/no-connect flags omitted", test_stage2_no_split_no_connect_flags_omitted),
     ("run: two stages, correct cwd + abs paths to both", test_run_two_stages_cwd_and_abs_paths),
