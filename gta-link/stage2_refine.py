@@ -93,6 +93,9 @@ class RefineDeps:
       * ``merge_tracklets(tracklets, seq2Dist, Dist, seq_name, max_x_range,
                           max_y_range, merge_dist_thres) -> dict``
       * ``save_results(out_path, tracklets) -> None``
+      * ``check_spatial_constraints(trk1, trk2, max_x, max_y) -> bool`` — only
+        needed by the ``--fast_merge`` path (``_fast_connect``); the default
+        slow path never touches it, so it stays optional (``None``).
     """
 
     def __init__(
@@ -102,12 +105,14 @@ class RefineDeps:
         get_distance_matrix,
         merge_tracklets,
         save_results,
+        check_spatial_constraints=None,
     ) -> None:
         self.get_spatial_constraints = get_spatial_constraints
         self.split_tracklets = split_tracklets
         self.get_distance_matrix = get_distance_matrix
         self.merge_tracklets = merge_tracklets
         self.save_results = save_results
+        self.check_spatial_constraints = check_spatial_constraints
 
 
 def _build_deps() -> RefineDeps:
@@ -126,7 +131,128 @@ def _build_deps() -> RefineDeps:
         get_distance_matrix=refine_tracklets.get_distance_matrix,
         merge_tracklets=refine_tracklets.merge_tracklets,
         save_results=refine_tracklets.save_results,
+        check_spatial_constraints=refine_tracklets.check_spatial_constraints,
     )
+
+
+def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
+    """Exact, batched replacement for ``get_distance_matrix`` + ``merge_tracklets``.
+
+    Produces the SAME merged ``{tid: Tracklet}`` as the slow path (up to float
+    rounding), but:
+
+      * builds the all-pairs cosine-distance matrix in ONE batched matmul
+        instead of ~N**2 per-pair ``get_distance`` calls (each of which moves
+        two feature tensors to the GPU and back — the actual bottleneck), and
+      * updates a merged tracklet's row with a single vector-matrix product
+        instead of N per-pair GPU calls.
+
+    Why it is EXACT, not an approximation
+    -------------------------------------
+    The slow ``get_distance(A, B)`` for non-overlapping tracklets is
+    ``mean over (i in A, j in B) of (1 - cosine(f_i, g_j))``.  Because the dot
+    product is bilinear, the average of the pairwise cosine *similarities*
+    equals the dot product of the per-tracklet means of the L2-normalized
+    features::
+
+        mean_{i,j} (f_i/|f_i|) . (g_j/|g_j|) = (mean_i f_i/|f_i|) . (mean_j g_j/|g_j|)
+
+    so ONE mean-of-normalized-features embedding per tracklet reproduces the
+    full pairwise mean exactly.  A merge uses a frame-count-weighted mean, so
+    the merged embedding equals what the slow path computes from the
+    concatenated feature lists.  Overlapping tracklets get distance 1 (max),
+    matching ``get_distance``'s ``set(times) & set(times)`` short-circuit —
+    here via a batched occupancy product.
+
+    The greedy hierarchical merge order, the spatial-constraint gate, and the
+    "block this pair" branch are reproduced exactly so the merge SEQUENCE (and
+    therefore the output) matches ``merge_tracklets``; only the distance
+    *arithmetic* is reorganized.  ``check_spatial_constraints`` and
+    ``save_results`` read only ``times`` / ``bboxes`` (never ``features``), so
+    this skips concatenating the (large) per-tracklet feature lists.
+    """
+    import numpy as np
+
+    if deps.check_spatial_constraints is None:
+        raise ValueError(
+            "fast_merge requires deps.check_spatial_constraints; build deps via "
+            "_build_deps() (it wires refine_tracklets.check_spatial_constraints)."
+        )
+
+    tids = list(tracklets.keys())
+    n = len(tids)
+    if n == 0:
+        return tracklets
+
+    # --- per-tracklet mean of L2-normalized features; weight = frame count ---
+    feat_dim = np.asarray(tracklets[tids[0]].features[0], dtype=np.float64).size
+    means = np.zeros((n, feat_dim), dtype=np.float64)  # mean-normalized embedding
+    counts = np.zeros(n, dtype=np.float64)             # weights (frame counts)
+    for i, tid in enumerate(tids):
+        feats = np.stack(
+            [np.asarray(f, dtype=np.float64).ravel() for f in tracklets[tid].features]
+        )  # (Li, D)
+        feats /= np.maximum(np.linalg.norm(feats, axis=1, keepdims=True), 1e-12)
+        means[i] = feats.mean(axis=0)
+        counts[i] = feats.shape[0]
+
+    # --- batched temporal-overlap matrix (share >=1 frame -> True) ----------
+    max_frame = max(int(max(t.times)) for t in tracklets.values())
+    occ = np.zeros((n, max_frame + 1), dtype=np.float32)
+    for i, tid in enumerate(tids):
+        occ[i, np.asarray(tracklets[tid].times, dtype=np.int64)] = 1.0
+    overlap = (occ @ occ.T) > 0.5  # (n, n) bool: True iff they share a frame
+
+    # --- all-pairs distance in ONE matmul -----------------------------------
+    Dist = 1.0 - (means @ means.T)
+    Dist[overlap] = 1.0
+    np.fill_diagonal(Dist, np.inf)  # diagonal excluded from the argmin
+
+    idx2tid = {i: tid for i, tid in enumerate(tids)}
+
+    # --- same greedy hierarchical merge as merge_tracklets ------------------
+    # argmin over the full matrix (diagonal = inf) picks the first off-diagonal
+    # minimum in row-major order — identical pair (and tie-break) to the
+    # original's argmin over the masked off-diagonal array. For a symmetric
+    # matrix that first hit is the upper-triangle one, so t1 < t2 always (t1
+    # therefore keeps its index after t2's row/col is deleted).
+    while True:
+        t1, t2 = np.unravel_index(int(np.argmin(Dist)), Dist.shape)
+        if Dist[t1, t2] >= merge_dist_thres:
+            break
+        track1 = tracklets[idx2tid[t1]]
+        track2 = tracklets[idx2tid[t2]]
+        if deps.check_spatial_constraints(track1, track2, max_x_range, max_y_range):
+            # merge track2 -> track1 (times + bboxes only; embedding via means)
+            track1.times += track2.times
+            track1.bboxes += track2.bboxes
+            tracklets.pop(idx2tid[t2])
+
+            # frame-count-weighted mean of normalized embeddings (exact)
+            new_count = counts[t1] + counts[t2]
+            means[t1] = (means[t1] * counts[t1] + means[t2] * counts[t2]) / new_count
+            counts[t1] = new_count
+            overlap[t1, :] |= overlap[t2, :]
+            overlap[:, t1] = overlap[t1, :]
+
+            # drop t2's row/col from every index-aligned structure
+            Dist = np.delete(np.delete(Dist, t2, axis=0), t2, axis=1)
+            means = np.delete(means, t2, axis=0)
+            counts = np.delete(counts, t2, axis=0)
+            overlap = np.delete(np.delete(overlap, t2, axis=0), t2, axis=1)
+            idx2tid = {i: tid for i, tid in enumerate(tracklets.keys())}
+
+            # recompute ONLY the merged tracklet's row/col (single matvec)
+            new_row = 1.0 - (means @ means[t1])
+            new_row[overlap[t1]] = 1.0
+            Dist[t1, :] = new_row
+            Dist[:, t1] = new_row
+            Dist[t1, t1] = np.inf
+        else:
+            # block this pair (== thres -> never < thres again), like the original
+            Dist[t1, t2] = Dist[t2, t1] = merge_dist_thres
+
+    return tracklets
 
 
 def run_refine(tmp, refined_txt, params, deps, seq_name):
@@ -157,7 +283,9 @@ def run_refine(tmp, refined_txt, params, deps, seq_name):
         Output path for the refined MOT txt (the contract ``refined.txt``).
     params:
         Dict with keys: ``use_split``, ``use_connect``, ``min_len``, ``eps``,
-        ``min_samples``, ``max_k``, ``spatial_factor``, ``merge_dist_thres``.
+        ``min_samples``, ``max_k``, ``spatial_factor``, ``merge_dist_thres``,
+        and optional ``fast_merge`` (bool; default False — use ``_fast_connect``
+        for the connect step instead of get_distance_matrix + merge_tracklets).
     deps:
         A :class:`RefineDeps` bundle of the algorithm callables.
     seq_name:
@@ -203,18 +331,48 @@ def run_refine(tmp, refined_txt, params, deps, seq_name):
     # --- connect/merge component (gated on use_connect — the DEVIATION) ---
     # Original main() runs get_distance_matrix + merge_tracklets UNCONDITIONALLY;
     # we gate them on use_connect so --use_split-only does not also merge.
+    #
+    # The connect step is the slow part (the original computes an N**2 distance
+    # matrix one pair at a time, each a GPU round-trip, then merges hierarchically
+    # recomputing rows the same way). The prints below flush so the otherwise
+    # SILENT multi-minute stretch shows progress in a non-TTY (subprocess) log.
+    use_fast = params.get("fast_merge", False)
     if use_connect:
-        Dist = deps.get_distance_matrix(split)
-        # merge_tracklets mutates `split` and takes a seq2Dist debug dict; pass
-        # an empty dict and the video stem as seq_name (per the task brief).
-        out = deps.merge_tracklets(
-            split,
-            {},
-            Dist,
-            seq_name=seq_name,
-            max_x_range=max_x_range,
-            max_y_range=max_y_range,
-            merge_dist_thres=params["merge_dist_thres"],
+        if use_fast:
+            print(
+                "[stage2] connect (fast): batched distance + merge over {} "
+                "tracklets...".format(n_tracklets_after_split),
+                flush=True,
+            )
+            out = _fast_connect(
+                split,
+                deps,
+                max_x_range=max_x_range,
+                max_y_range=max_y_range,
+                merge_dist_thres=params["merge_dist_thres"],
+            )
+        else:
+            print(
+                "[stage2] connect (slow): building {n}x{n} distance "
+                "matrix...".format(n=n_tracklets_after_split),
+                flush=True,
+            )
+            Dist = deps.get_distance_matrix(split)
+            print("[stage2] connect (slow): merging tracklets...", flush=True)
+            # merge_tracklets mutates `split` and takes a seq2Dist debug dict; pass
+            # an empty dict and the video stem as seq_name (per the task brief).
+            out = deps.merge_tracklets(
+                split,
+                {},
+                Dist,
+                seq_name=seq_name,
+                max_x_range=max_x_range,
+                max_y_range=max_y_range,
+                merge_dist_thres=params["merge_dist_thres"],
+            )
+        print(
+            "[stage2] connect: done ({} tracklets after merge).".format(len(out)),
+            flush=True,
         )
     else:
         out = split
@@ -316,6 +474,16 @@ def make_parser() -> argparse.ArgumentParser:
         default=0.4,
         help="Minimum cosine distance between two tracklets for merging.",
     )
+    parser.add_argument(
+        "--fast_merge",
+        action="store_true",
+        default=False,
+        help="Use the exact batched connect/merge (_fast_connect) instead of the "
+        "original per-pair GPU path. Same output (up to float rounding), but "
+        "the O(N^2) distance matrix becomes one matmul and per-merge row "
+        "updates become one matvec — seconds instead of many minutes. Only "
+        "affects --use_connect; splitting is unchanged.",
+    )
     return parser
 
 
@@ -375,6 +543,7 @@ def main(args) -> None:
         "max_k": args.max_k,
         "spatial_factor": args.spatial_factor,
         "merge_dist_thres": args.merge_dist_thres,
+        "fast_merge": args.fast_merge,
     }
 
     io_counts = {
@@ -392,6 +561,7 @@ def main(args) -> None:
         "merge_dist_thres": args.merge_dist_thres,
         "min_len": args.min_len,
         "spatial_factor": args.spatial_factor,
+        "fast_merge": args.fast_merge,
     }
 
     with profile_stage("02_refine", paths, extra=io_counts):

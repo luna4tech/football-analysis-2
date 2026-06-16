@@ -148,6 +148,11 @@ class _Recorder:
         self.saved_path = out_path
         self.saved_obj = tracklets
 
+    # check_spatial_constraints(trk1, trk2, max_x, max_y) -> bool (fast path only)
+    def check_spatial_constraints(self, trk1, trk2, max_x_range, max_y_range):
+        self.calls.append("spatial_check")
+        return True
+
 
 def _deps_from(rec: _Recorder) -> "RefineDeps":
     return RefineDeps(
@@ -156,10 +161,11 @@ def _deps_from(rec: _Recorder) -> "RefineDeps":
         get_distance_matrix=rec.get_distance_matrix,
         merge_tracklets=rec.merge_tracklets,
         save_results=rec.save_results,
+        check_spatial_constraints=rec.check_spatial_constraints,
     )
 
 
-def _params(use_split, use_connect):
+def _params(use_split, use_connect, fast_merge=False):
     return {
         "use_split": use_split,
         "use_connect": use_connect,
@@ -169,6 +175,7 @@ def _params(use_split, use_connect):
         "max_k": 3,
         "spatial_factor": 1.0,
         "merge_dist_thres": 0.4,
+        "fast_merge": fast_merge,
     }
 
 
@@ -275,6 +282,131 @@ def test_split_params_forwarded():
 
 
 # ===========================================================================
+# Fast connect/merge (_fast_connect) — CPU-only, numpy + stubbed spatial gate
+# ===========================================================================
+class _FakeTrack:
+    """Minimal Tracklet stand-in for _fast_connect (numpy-only)."""
+
+    def __init__(self, track_id, times, feats, bboxes=None):
+        self.track_id = track_id
+        self.parent_id = track_id
+        self.times = list(times)
+        self.features = [np.asarray(f, dtype=np.float64) for f in feats]
+        self.bboxes = (
+            list(bboxes) if bboxes is not None
+            else [[0.0, 0.0, 1.0, 1.0] for _ in times]
+        )
+        self.scores = [1.0 for _ in times]
+
+
+def _fast_deps(spatial_ok=True):
+    """Deps bundle for the fast path: only check_spatial_constraints is used.
+
+    The slow callables raise if touched, proving the fast path never calls them.
+    """
+    def _forbidden(*_a, **_k):  # noqa: ANN002, ANN003
+        raise AssertionError("slow connect path must not run under fast_merge")
+
+    return RefineDeps(
+        get_spatial_constraints=lambda t, f: (1e9, 1e9),
+        split_tracklets=_forbidden,
+        get_distance_matrix=_forbidden,
+        merge_tracklets=_forbidden,
+        save_results=lambda p, o: None,
+        check_spatial_constraints=lambda a, b, mx, my: spatial_ok,
+    )
+
+
+_V0 = [1.0, 0.0, 0.0, 0.0]   # one unit direction
+_V1 = [0.0, 1.0, 0.0, 0.0]   # an orthogonal direction (cosine distance 1.0)
+
+
+def test_fast_merges_identical_nonoverlapping():
+    # Two non-overlapping tracklets with identical feats -> distance ~0 -> merge.
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
+    }
+    out = _s2._fast_connect(trks, _fast_deps(spatial_ok=True),
+                            max_x_range=1e9, max_y_range=1e9, merge_dist_thres=0.4)
+    assert len(out) == 1, "identical non-overlapping tracklets must merge to one"
+    survivor = next(iter(out.values()))
+    # merged track keeps t1's id (smaller index) and concatenates times/bboxes.
+    assert sorted(survivor.times) == [0, 1, 2, 3, 4, 10, 11, 12, 13, 14], survivor.times
+    assert len(survivor.bboxes) == 10, len(survivor.bboxes)
+
+
+def test_fast_keeps_orthogonal_apart():
+    # Orthogonal feats -> distance ~1.0 >= thres -> never merge.
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V1] * 5),
+    }
+    out = _s2._fast_connect(trks, _fast_deps(spatial_ok=True),
+                            max_x_range=1e9, max_y_range=1e9, merge_dist_thres=0.4)
+    assert len(out) == 2, "orthogonal tracklets must not merge"
+
+
+def test_fast_overlap_blocks_merge():
+    # Identical feats but SHARED frames (2,3,4) -> distance forced to 1 -> no merge.
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(2, 7), [_V0] * 5),
+    }
+    out = _s2._fast_connect(trks, _fast_deps(spatial_ok=True),
+                            max_x_range=1e9, max_y_range=1e9, merge_dist_thres=0.4)
+    assert len(out) == 2, "temporally overlapping tracklets must not merge"
+
+
+def test_fast_spatial_gate_blocks_merge():
+    # Mergeable by distance, but the spatial gate vetoes -> stays apart.
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
+    }
+    out = _s2._fast_connect(trks, _fast_deps(spatial_ok=False),
+                            max_x_range=1e9, max_y_range=1e9, merge_dist_thres=0.4)
+    assert len(out) == 2, "spatial-gate veto must prevent the merge"
+
+
+def test_fast_chain_merges_only_similar():
+    # 1 & 2 identical (merge); 3 orthogonal (stays). Result: {merged(1,2), 3}.
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
+        3: _FakeTrack(3, range(20, 25), [_V1] * 5),
+    }
+    out = _s2._fast_connect(trks, _fast_deps(spatial_ok=True),
+                            max_x_range=1e9, max_y_range=1e9, merge_dist_thres=0.4)
+    assert len(out) == 2, out.keys()
+    lens = sorted(len(t.times) for t in out.values())
+    assert lens == [5, 10], lens   # the orthogonal one (5) + the merged pair (10)
+
+
+def test_run_refine_fast_path_routing():
+    # fast_merge=True with use_connect must use _fast_connect (NOT the slow
+    # get_distance_matrix / merge_tracklets, which raise if called).
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
+    }
+    saved = {}
+
+    def _save(path, obj):
+        saved["path"] = path
+        saved["obj"] = obj
+
+    deps = _fast_deps(spatial_ok=True)
+    deps.save_results = _save  # capture what gets written
+    counts = run_refine(trks, "/contract/refined.txt",
+                        _params(use_split=False, use_connect=True, fast_merge=True),
+                        deps, seq_name="clip")
+    assert saved["path"] == "/contract/refined.txt", saved
+    assert len(saved["obj"]) == 1, "fast path should have merged to one tracklet"
+    assert counts["n_tracklets_in"] == 2 and counts["n_tracklets_out"] == 1, counts
+
+
+# ===========================================================================
 # Optional real end-to-end refine (SKIPS gracefully when heavy deps missing)
 # ===========================================================================
 def _heavy_deps_available() -> bool:
@@ -322,6 +454,65 @@ def test_optional_end_to_end_real_refine():
     print("    real refine wrote {} rows".format(len(rows)))
 
 
+def test_optional_fast_equals_slow_end_to_end():
+    """Slow path == fast path on a synthetic clip (skips if heavy deps missing).
+
+    This is the equivalence proof for ``--fast_merge``: run the real
+    ``get_distance_matrix`` + ``merge_tracklets`` and the batched
+    ``_fast_connect`` over the SAME input and assert byte-identical
+    ``refined.txt``.  Distances are unambiguous (0 for mergeable pairs, 1
+    otherwise — well clear of the 0.4 threshold) so the float32-vs-float64
+    rounding caveat cannot flip a decision here.
+    """
+    import copy
+
+    if not _heavy_deps_available():
+        print("    SKIP (heavy deps unavailable: refine_tracklets cannot import)")
+        return
+
+    if str(_GTA_LINK_DIR) not in sys.path:
+        sys.path.insert(0, str(_GTA_LINK_DIR))
+    from Tracklet import Tracklet  # noqa: WPS433
+
+    bbox = [100.0, 100.0, 30.0, 60.0]  # identical box -> spatial gate always passes
+
+    def _mk(tid, frames, vec):
+        feats = [np.asarray(vec, dtype=np.float32) for _ in frames]
+        scores = [1.0 for _ in frames]
+        bboxes = [list(bbox) for _ in frames]
+        return Tracklet(tid, list(frames), scores, bboxes, feats=feats)
+
+    # A+B identical (merge); C+D identical (merge); the two groups orthogonal.
+    def _build():
+        return {
+            1: _mk(1, range(0, 10), _V0),
+            2: _mk(2, range(20, 30), _V0),
+            3: _mk(3, range(40, 50), _V1),
+            4: _mk(4, range(60, 70), _V1),
+        }
+
+    deps = _s2._build_deps()
+    with tempfile.TemporaryDirectory() as td:
+        slow_path = str(Path(td) / "slow.txt")
+        fast_path = str(Path(td) / "fast.txt")
+        run_refine(copy.deepcopy(_build()), slow_path,
+                   _params(use_split=False, use_connect=True, fast_merge=False),
+                   deps, seq_name="synthetic")
+        run_refine(copy.deepcopy(_build()), fast_path,
+                   _params(use_split=False, use_connect=True, fast_merge=True),
+                   deps, seq_name="synthetic")
+        slow_txt = Path(slow_path).read_text()
+        fast_txt = Path(fast_path).read_text()
+        assert slow_txt == fast_txt, (
+            "fast_merge output must byte-match the slow path on unambiguous "
+            "input.\n--- slow ---\n{}\n--- fast ---\n{}".format(slow_txt, fast_txt)
+        )
+        # And the merges actually happened: 4 tracklets -> 2 ids.
+        ids = {row.split(",")[1] for row in slow_txt.strip().splitlines()}
+        assert len(ids) == 2, ids
+    print("    fast == slow (4 tracklets -> 2 merged ids), refined.txt identical")
+
+
 _TESTS = [
     ("run_refine: --use_split only -> split, no merge, save split", test_split_only_no_merge),
     ("run_refine: --use_connect only -> merge, no split", test_connect_only_no_split),
@@ -330,7 +521,14 @@ _TESTS = [
     ("run_refine: save target is the contract refined_txt", test_save_target_is_contract_path),
     ("run_refine: spatial from original+factor, threaded into merge", test_spatial_uses_original_and_factor),
     ("run_refine: split params forwarded by name", test_split_params_forwarded),
+    ("fast_connect: identical non-overlapping tracklets merge", test_fast_merges_identical_nonoverlapping),
+    ("fast_connect: orthogonal tracklets stay apart", test_fast_keeps_orthogonal_apart),
+    ("fast_connect: temporal overlap blocks merge", test_fast_overlap_blocks_merge),
+    ("fast_connect: spatial-gate veto blocks merge", test_fast_spatial_gate_blocks_merge),
+    ("fast_connect: chain merges only the similar pair", test_fast_chain_merges_only_similar),
+    ("run_refine: fast_merge routes to _fast_connect (slow path not called)", test_run_refine_fast_path_routing),
     ("run_refine: optional real end-to-end refine (skips w/o deps)", test_optional_end_to_end_real_refine),
+    ("run_refine: optional fast==slow equivalence (skips w/o deps)", test_optional_fast_equals_slow_end_to_end),
 ]
 
 

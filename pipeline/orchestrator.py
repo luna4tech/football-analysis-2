@@ -85,6 +85,11 @@ class RunOptions:
         ``--no-split`` / ``--no-connect`` on the CLI; at least one must remain.
     eps, min_samples, max_k, min_len, spatial_factor, merge_dist_thres
         Refine algorithm params (same defaults as Stage 2's parser).
+    fast_merge : bool
+        Use Stage 2's exact batched connect/merge (``--fast_merge``) instead of
+        the original per-pair GPU path. Same output (up to float rounding),
+        orders of magnitude faster on the connect step. Only affects
+        ``--use_connect``.
 
     Force
     -----
@@ -114,6 +119,7 @@ class RunOptions:
         min_len: int = 100,
         spatial_factor: float = 1.0,
         merge_dist_thres: float = 0.4,
+        fast_merge: bool = False,
         force_stage1: bool = False,
         force_stage2: bool = False,
         artifacts_dir: "Optional[str]" = None,
@@ -131,6 +137,7 @@ class RunOptions:
         self.min_len = min_len
         self.spatial_factor = spatial_factor
         self.merge_dist_thres = merge_dist_thres
+        self.fast_merge = fast_merge
         self.force_stage1 = force_stage1
         self.force_stage2 = force_stage2
         self.artifacts_dir = artifacts_dir
@@ -214,6 +221,8 @@ def build_stage2_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
         "--spatial_factor", str(opts.spatial_factor),
         "--merge_dist_thres", str(opts.merge_dist_thres),
     ]
+    if opts.fast_merge:
+        cmd += ["--fast_merge"]
     if opts.force_stage2:
         cmd += ["--force"]
     return cmd

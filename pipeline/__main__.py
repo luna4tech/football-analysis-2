@@ -130,6 +130,14 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         default=0.4,
         help="max cosine distance to merge two tracklets",
     )
+    g2.add_argument(
+        "--fast-merge",
+        dest="fast_merge",
+        action="store_true",
+        default=False,
+        help="exact batched connect/merge (same output, orders of magnitude "
+        "faster than the per-pair GPU path); only affects --use_connect",
+    )
 
     # --- Force ---
     gf = p.add_argument_group("force recompute (params alone do NOT bust the cache)")
@@ -179,6 +187,7 @@ def _run_from_args(args: argparse.Namespace) -> int:
         min_len=args.min_len,
         spatial_factor=args.spatial_factor,
         merge_dist_thres=args.merge_dist_thres,
+        fast_merge=args.fast_merge,
         force_stage1=args.force_all or args.force_stage1,
         force_stage2=args.force_all or args.force_stage2,
         artifacts_dir=args.artifacts_dir,
