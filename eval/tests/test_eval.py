@@ -569,9 +569,11 @@ def test_run_trackeval_raises_import_error_without_trackeval():
 # ---------------------------------------------------------------------------
 
 # Fake raw result dict mirroring what TrackEval's Evaluator.evaluate returns.
-# Structure: result[dataset_key][tracker_name]["COMBINED_SEQ"][class_name][metric_name]
-#
-# HOTA/DetA/AssA are arrays over alpha thresholds; MOTA/IDF1 are scalars.
+# Structure: result[dataset][tracker]["COMBINED_SEQ"][class][FAMILY][metric_name],
+# where FAMILY is "HOTA"/"CLEAR"/"Identity"/"Count". HOTA/DetA/AssA live under the
+# "HOTA" family as arrays over alpha thresholds; MOTA under "CLEAR", IDF1 under
+# "Identity" as scalars. TrackEval stores FRACTIONS (0-1); the params below are
+# percentages for readability, divided by 100 to match the real structure.
 def _fake_result(
     tracker: str = "refined",
     cls: str = "pedestrian",
@@ -582,15 +584,22 @@ def _fake_result(
     idf1: float = 81.25,
 ) -> dict:
     alpha_count = 19
-    per_class = {
-        "HOTA": np.full(alpha_count, hota),
-        "DetA": np.full(alpha_count, det_a),
-        "AssA": np.full(alpha_count, ass_a),
-        "MOTA": mota,
-        "IDF1": idf1,
-        # Extra keys TrackEval emits — must be tolerated.
+    hota_family = {
+        "HOTA": np.full(alpha_count, hota / 100.0),
+        "DetA": np.full(alpha_count, det_a / 100.0),
+        "AssA": np.full(alpha_count, ass_a / 100.0),
+        "LocA": np.full(alpha_count, 0.88),
+        # Extra key TrackEval emits — must be tolerated.
         "_extra": "ignore me",
-        "LocA": np.full(alpha_count, 88.0),
+    }
+    clear_family = {"MOTA": mota / 100.0, "MOTP": 0.75, "IDSW": 124, "Frag": 1578}
+    identity_family = {"IDF1": idf1 / 100.0, "IDR": 0.86, "IDP": 0.76}
+    count_family = {"Dets": 116748, "GT_Dets": 102918, "IDs": 64, "GT_IDs": 25}
+    per_class = {
+        "HOTA": hota_family,
+        "CLEAR": clear_family,
+        "Identity": identity_family,
+        "Count": count_family,
     }
     return {
         "MotChallenge2DBox": {
@@ -634,8 +643,8 @@ def test_extract_metrics_wrong_tracker_raises():
 
 def test_extract_metrics_missing_metric_raises():
     result = _fake_result()
-    # Drop MOTA from the inner dict.
-    del result["MotChallenge2DBox"]["refined"]["COMBINED_SEQ"]["pedestrian"]["MOTA"]
+    # Drop MOTA from the CLEAR family.
+    del result["MotChallenge2DBox"]["refined"]["COMBINED_SEQ"]["pedestrian"]["CLEAR"]["MOTA"]
     raised = False
     try:
         extract_metrics(result, tracker_name="refined")

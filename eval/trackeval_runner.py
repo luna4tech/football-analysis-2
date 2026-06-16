@@ -554,7 +554,10 @@ def extract_metrics(
     The raw result comes from
     ``trackeval.Evaluator(...).evaluate(dataset_list, metrics_list)``
     — a nested dict keyed by dataset name, then tracker, then
-    ``"COMBINED_SEQ"``, then class name.
+    ``"COMBINED_SEQ"``, then class name, then metric FAMILY
+    (``"HOTA"`` / ``"CLEAR"`` / ``"Identity"`` / ``"Count"``), each a dict of
+    ``metric_name -> value``. So HOTA/DetA/AssA live under the ``"HOTA"`` family,
+    MOTA under ``"CLEAR"``, IDF1 under ``"Identity"``.
 
     GOTCHA — array vs scalar
     ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -579,7 +582,9 @@ def extract_metrics(
     Returns
     -------
     dict
-        ``{HOTA, DetA, AssA, MOTA, IDF1}`` as floats.
+        ``{HOTA, DetA, AssA, MOTA, IDF1}`` as floats, expressed as PERCENTAGES
+        (0-100) to match TrackEval's printed table and the MOT literature
+        (TrackEval stores fractions internally; we multiply by 100).
 
     Raises
     ------
@@ -626,27 +631,47 @@ def extract_metrics(
         )
     metrics_raw: dict = by_class[class_name]
 
-    def _scalar(key: str) -> float:
-        """Pull a scalar or array metric, returning float(mean) for arrays."""
-        if key not in metrics_raw:
+    # Level 5: metric FAMILY. TrackEval nests per-class results one level deeper,
+    # keyed by the metric class that produced them ("HOTA", "CLEAR", "Identity",
+    # "Count"); each family is a dict of metric_name -> value.
+    def _family(name: str) -> dict:
+        if name not in metrics_raw:
             raise KeyError(
-                f"metric {key!r} missing from COMBINED_SEQ[{class_name!r}]; "
-                f"available: {sorted(k for k in metrics_raw if not k.startswith('_'))}"
+                f"metric family {name!r} missing from COMBINED_SEQ[{class_name!r}]; "
+                f"available: {sorted(metrics_raw)}"
             )
-        val = metrics_raw[key]
-        # HOTA/DetA/AssA are arrays over alpha thresholds; MOTA/IDF1 are scalars.
+        fam = metrics_raw[name]
+        if not isinstance(fam, dict):
+            raise KeyError(
+                f"expected metric family {name!r} to be a dict; got {type(fam).__name__}"
+            )
+        return fam
+
+    def _pct(fam: dict, fam_name: str, key: str) -> float:
+        """Metric as a percentage (0-100). HOTA/DetA/AssA are arrays over alpha
+        thresholds (mean is the headline); MOTA/IDF1 are scalars. TrackEval stores
+        fractions, so we * 100 to match its printed table / the MOT literature."""
+        if key not in fam:
+            raise KeyError(
+                f"metric {key!r} missing from {fam_name!r} family; "
+                f"available: {sorted(k for k in fam if not str(k).startswith('_'))}"
+            )
+        val = fam[key]
         try:
             arr = np.asarray(val, dtype=float)
-            if arr.ndim == 0:
-                return float(arr)
-            return float(np.mean(arr))
         except (TypeError, ValueError) as exc:
-            raise KeyError(f"cannot convert {key!r}={val!r} to float: {exc}") from exc
+            raise KeyError(f"cannot convert {fam_name}.{key}={val!r} to float: {exc}") from exc
+        scalar = float(arr) if arr.ndim == 0 else float(np.mean(arr))
+        return scalar * 100.0
 
+    # SINGLE place mapping our headline metrics to their (family, key).
+    hota_fam = _family("HOTA")
+    clear_fam = _family("CLEAR")
+    id_fam = _family("Identity")
     return {
-        "HOTA": _scalar("HOTA"),
-        "DetA": _scalar("DetA"),
-        "AssA": _scalar("AssA"),
-        "MOTA": _scalar("MOTA"),
-        "IDF1": _scalar("IDF1"),
+        "HOTA": _pct(hota_fam, "HOTA", "HOTA"),
+        "DetA": _pct(hota_fam, "HOTA", "DetA"),
+        "AssA": _pct(hota_fam, "HOTA", "AssA"),
+        "MOTA": _pct(clear_fam, "CLEAR", "MOTA"),
+        "IDF1": _pct(id_fam, "Identity", "IDF1"),
     }
