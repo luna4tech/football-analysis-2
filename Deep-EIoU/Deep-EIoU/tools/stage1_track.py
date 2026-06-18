@@ -119,7 +119,7 @@ _GTA_LINK_DIR = osp.join(_REPO_ROOT, "gta-link")
 # ---------------------------------------------------------------------------
 # Shared per-frame post-detection math (the parity guarantee)
 # ---------------------------------------------------------------------------
-def det_and_crops_from_output(output, frame, width, height):
+def det_and_crops_from_output(output, frame, width, height, rescale_boxes=True):
     """Turn ONE frame's raw detector output into ``(det, crops)``.
 
     This is the single source of truth for the per-frame post-detection math —
@@ -153,16 +153,17 @@ def det_and_crops_from_output(output, frame, width, height):
     if output is None:
         return None, None
 
-    # --- rescale boxes + drop edge detections (verbatim from demo.py) ---
+    # --- optional YOLOX rescale + drop edge detections ---
     if hasattr(output, "detach"):
         output = output.detach()
     if hasattr(output, "cpu"):
         output = output.cpu()
     if hasattr(output, "numpy"):
         output = output.numpy()
-    det = np.asarray(output)
-    scale = min(1440 / width, 800 / height)
-    det /= scale
+    det = np.asarray(output, dtype=np.float32).copy()
+    if rescale_boxes:
+        scale = min(1440 / width, 800 / height)
+        det /= scale
     rows_to_remove = np.any(det[:, 0:4] < 1, axis=1)  # remove edge detection
     det = det[~rows_to_remove]
 
@@ -184,6 +185,8 @@ def det_and_crops_from_output(output, frame, width, height):
 class YoloXDetector:
     """Adapter around the existing YOLOX Predictor."""
 
+    rescale_boxes = True
+
     def __init__(self, predictor):
         self.predictor = predictor
 
@@ -198,6 +201,8 @@ class YoloXDetector:
 
 class YOLOv11Detector:
     """Ultralytics YOLO adapter that emits YOLOX-shaped detection rows."""
+
+    rescale_boxes = False
 
     def __init__(self, ckpt_path, args, device_str):
         try:
@@ -266,7 +271,9 @@ def perceive(frame, detector, extractor, width, height):
         ``outputs[0] is None`` branch, which emits nothing).
     """
     output = detector.infer_one(frame)
-    det, crops = det_and_crops_from_output(output, frame, width, height)
+    det, crops = det_and_crops_from_output(
+        output, frame, width, height, rescale_boxes=detector.rescale_boxes
+    )
     if det is None:
         return None, None
     if not crops:
@@ -416,7 +423,9 @@ def perceive_batch(frames, detector, extractor, width, height):
     counts = []                     # per-frame crop count (int) or None passthrough
     all_crops = []                  # flat list of every crop across the batch
     for output, frame in zip(outputs, frames):
-        det, crops = det_and_crops_from_output(output, frame, width, height)
+        det, crops = det_and_crops_from_output(
+            output, frame, width, height, rescale_boxes=detector.rescale_boxes
+        )
         dets.append(det)
         if det is None:
             counts.append(None)
