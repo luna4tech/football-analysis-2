@@ -148,7 +148,7 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         "--fast-merge",
         dest="fast_merge",
         action="store_true",
-        default=False,
+        default=True,
         help="exact batched connect/merge (same output, orders of magnitude "
         "faster than the per-pair GPU path); only affects --use_connect",
     )
