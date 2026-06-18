@@ -105,6 +105,8 @@ def test_stage1_sequential_command():
     assert _value_after(cmd, "--video") == "/abs/clip.mp4", cmd
     assert _value_after(cmd, "--artifacts-dir") == "/abs/artifacts", cmd
     assert _value_after(cmd, "--device") == "gpu", cmd
+    assert _value_after(cmd, "--detector") == "yolov11", cmd
+    assert _value_after(cmd, "--detector-ckpt") == "checkpoints/yolov11l.pt", cmd
     # sequential: no parallel/batch/force.
     assert "--parallel" not in cmd, cmd
     assert "--batch-size" not in cmd, cmd
@@ -117,6 +119,13 @@ def test_stage1_parallel_forwards_batch():
     assert "--parallel" in cmd, cmd
     assert _value_after(cmd, "--batch-size") == "16", cmd
     assert _value_after(cmd, "--device") == "cpu", cmd
+
+
+def test_stage1_yolox_forwards_legacy_detector():
+    opts = RunOptions(detector="yolox")
+    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
+    assert _value_after(cmd, "--detector") == "yolox", cmd
+    assert _value_after(cmd, "--detector-ckpt") == "checkpoints/best_ckpt.pth.tar", cmd
 
 
 def test_stage1_force_adds_force():
@@ -368,6 +377,7 @@ def test_compare_key_mismatch_not_equivalent():
 _TESTS = [
     ("stage1 sequential command shape", test_stage1_sequential_command),
     ("stage1 --parallel forwards --batch-size", test_stage1_parallel_forwards_batch),
+    ("stage1 --detector yolox forwards legacy detector", test_stage1_yolox_forwards_legacy_detector),
     ("stage1 force adds --force", test_stage1_force_adds_force),
     ("stage1 --fp16/--fuse off by default", test_stage1_fp16_and_fuse_off_by_default),
     ("stage1 --fp16/--fuse forwarded", test_stage1_fp16_and_fuse_forwarded),

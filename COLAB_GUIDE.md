@@ -24,14 +24,14 @@ You also need two model checkpoints (they are **not** in the repo — they are g
 
 | File | Used by | Where it must end up |
 |------|---------|----------------------|
-| `best_ckpt.pth.tar` | YOLOX detector (Stage 1) | `Deep-EIoU/Deep-EIoU/checkpoints/best_ckpt.pth.tar` |
+| `yolov11l.pt` | YOLOv11 detector (Stage 1 default) | `Deep-EIoU/Deep-EIoU/checkpoints/yolov11l.pt` |
 | `sports_model.pth.tar-60` | OSNet ReID (Stage 1) | `Deep-EIoU/Deep-EIoU/checkpoints/sports_model.pth.tar-60` |
 
-Both live in the public Google Drive folder linked from the Deep-EIoU readme:
+Put your custom `yolov11l.pt` in your Drive `checkpoints/` folder. The ReID model lives in the public Google Drive folder linked from the Deep-EIoU readme:
 **<https://drive.google.com/drive/folders/1wItcb0yeGaxOS08_G9yRWBTnpVf0vZ2w>**
 
-You don't need to download them by hand — **Step 4 below fetches them with `gdown`** into your
-Drive `checkpoints/` folder (once) and links them into place. Nothing to do here.
+Step 4 below fetches the ReID model with `gdown` into your
+Drive `checkpoints/` folder (once) and links them into place. Put your custom `yolov11l.pt` there first.
 
 ---
 
@@ -90,13 +90,13 @@ print("Input videos available:")
 ### 3. Install dependencies
 Colab already has `torch`/`torchvision`. Install GtaLink's `requirements.txt` (it's the
 comprehensive set that covers Stage 2's refine libraries **and** the import-time deps of the
-bundled torchreid that Stage 1's ReID needs), then add the two libraries it doesn't list —
-`cython_bbox` (the tracker's IoU) and `tqdm`:
+bundled torchreid that Stage 1's ReID needs), then add the libraries it doesn't list —
+`cython_bbox` (the tracker's IoU), `tqdm`, and `ultralytics`:
 
 ```python
 %cd $REPO
 !pip install -q -r gta-link/requirements.txt
-!pip install -q cython_bbox tqdm
+!pip install -q cython_bbox tqdm ultralytics
 !pip install -q -e Deep-EIoU/Deep-EIoU/reid
 ```
 
@@ -128,10 +128,10 @@ it launches each as a subprocess:
 | 1 (track) | `Deep-EIoU/Deep-EIoU` | `from reid.torchreid.utils import FeatureExtractor` → the vendored `Deep-EIoU/Deep-EIoU/reid/` package installed editable above (so top-level `torchreid` resolves to it) |
 | 2 (refine) | `gta-link` | does **not** import `reid`/`torchreid` — it reuses Stage 1's cached embeddings |
 
-### 4. Fetch the checkpoints (once, to Drive) and link them into place
-Downloads the two model files from the public Drive folder into your Drive `checkpoints/` folder
-the first time, then reuses them on later sessions. Finally it symlinks them into the directory
-Stage 1 expects.
+### 4. Fetch/link the checkpoints
+Downloads the ReID model from the public Drive folder into your Drive `checkpoints/` folder
+the first time, then reuses it on later sessions. Your custom `yolov11l.pt` must already be in
+that Drive folder. Finally it symlinks both files into the directory Stage 1 expects.
 
 ```python
 import glob, os
@@ -139,18 +139,18 @@ import glob, os
 os.makedirs(CKPT_DIR, exist_ok=True)
 CKPT_FOLDER_URL = "https://drive.google.com/drive/folders/1wItcb0yeGaxOS08_G9yRWBTnpVf0vZ2w"
 
-# Download only if not already in Drive (the files are large — avoid re-downloading each session).
+# Download only the ReID model if it is not already in Drive.
 have = {os.path.basename(p) for p in glob.glob(f"{CKPT_DIR}/**/*", recursive=True)}
-if not {"best_ckpt.pth.tar", "sports_model.pth.tar-60"} <= have:
+if "sports_model.pth.tar-60" not in have:
     !pip install -q gdown
     !gdown --folder "{CKPT_FOLDER_URL}" -O "$CKPT_DIR"
 
 # Link each checkpoint into Deep-EIoU/Deep-EIoU/checkpoints/ (robust to any sub-folder gdown made).
 dst_dir = f"{REPO}/Deep-EIoU/Deep-EIoU/checkpoints"
 os.makedirs(dst_dir, exist_ok=True)
-for name in ("best_ckpt.pth.tar", "sports_model.pth.tar-60"):
+for name in ("yolov11l.pt", "sports_model.pth.tar-60"):
     matches = glob.glob(f"{CKPT_DIR}/**/{name}", recursive=True)
-    assert matches, f"{name} not found under {CKPT_DIR} — check the gdown download"
+    assert matches, f"{name} not found under {CKPT_DIR}"
     dst = f"{dst_dir}/{name}"
     if os.path.islink(dst) or os.path.exists(dst):
         os.remove(dst)
@@ -161,8 +161,8 @@ for name in ("best_ckpt.pth.tar", "sports_model.pth.tar-60"):
 ```
 
 > If `gdown --folder` ever fails (Drive quota / auth), open the folder link in a browser, download
-> the two files manually, and drop them into your Drive `checkpoints/` folder — then re-run this
-> cell (it will skip the download and just link them).
+> `sports_model.pth.tar-60` manually, and drop it into your Drive `checkpoints/` folder. Your
+> custom `yolov11l.pt` must also be in that folder before you run this cell.
 
 ### 5. Run the full pipeline → outputs straight to Drive
 
@@ -265,16 +265,17 @@ After a run, `Colab Notebooks/football-analysis-project/output/gta-track/<STEM>/
 - **GPU out of memory** in `--parallel`: lower `--batch-size` (e.g. 4 or 2), or drop `--parallel`
   to run sequentially.
 - **`FileNotFoundError` for a checkpoint**: re-check Step 4 — the symlinks must resolve to real
-  files in your Drive `checkpoints/` folder, and `sports_model.pth.tar-60` must keep that exact
-  name.
+  files in your Drive `checkpoints/` folder, and `yolov11l.pt` plus
+  `sports_model.pth.tar-60` must keep those exact names.
 - **Writing to Drive is slow / flaky on long videos** (the `tracklets.pkl` can be hundreds of MB):
   run with `--artifacts-dir /content/work` (fast local disk), then copy results to Drive at the
   end: `!cp -r "/content/work/$STEM" "$OUTPUT_DIR/"`.
 - **Re-tuning a parameter seems ignored**: that's the cache — add the matching `--force-*` flag
   (see Step 5).
 - **Path with a space** (`Colab Notebooks`): always keep the `"$VAR"` quotes in the `!` cells.
-- **Wrong/blank detections**: ensure the detector `best_ckpt.pth.tar` matches the YOLOX exp
-  (`yolox/yolox_x_ch_sportsmot.py`, the Stage 1 default).
+- **Wrong/blank detections**: ensure `yolov11l.pt` is the custom Ultralytics YOLOv11 checkpoint
+  you intend to use. For the legacy detector, run with `--detector yolox` and ensure
+  `best_ckpt.pth.tar` matches `yolox/yolox_x_ch_sportsmot.py`.
 - **Running stages independently** (e.g. only refine, from a cached `tracklets.pkl`) is documented
   in [USER_GUIDE.md](USER_GUIDE.md) — the Colab commands are the same, just `cd gta-link` and call
   `stage2_refine.py` with the shared `--artifacts-dir`.
