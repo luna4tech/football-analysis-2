@@ -75,6 +75,24 @@ def make_parser():
         action="store_true",
         help="treat the frame column as 1-based (MOT/SportsMOT). demo.py output is 0-based.",
     )
+    parser.add_argument(
+        "--line_thickness",
+        type=int,
+        default=1,
+        help="bounding-box line thickness in px (default: 1; demo.py uses 3)",
+    )
+    parser.add_argument(
+        "--text_scale",
+        type=float,
+        default=1.0,
+        help="id-label font scale (default: 1.0; demo.py uses 2)",
+    )
+    parser.add_argument(
+        "--text_thickness",
+        type=int,
+        default=1,
+        help="id-label font thickness (default: 1; demo.py uses 2)",
+    )
     return parser
 
 
@@ -147,7 +165,10 @@ def main():
         if key in frames:
             tlwhs, ids, _ = frames[key]
             online_im = plot_tracking(
-                frame, tlwhs, ids, frame_id=frame_idx + 1, fps=out_fps
+                frame, tlwhs, ids, frame_id=frame_idx + 1, fps=out_fps,
+                line_thickness=args.line_thickness,
+                text_scale=args.text_scale,
+                text_thickness=args.text_thickness,
             )
             matched_frames += 1
         else:
