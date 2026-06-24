@@ -62,34 +62,24 @@ STAGE2_SCRIPT = "stage2_refine.py"        # relative to STAGE2_CWD
 class RunOptions:
     """All knobs for an orchestrated run.
 
-    Stage 1
-    -------
+    Stage 1 (YOLOv11 detection + ReID + online tracking)
+    ----------------------------------------------------
     device : str
         ``"gpu"`` (default) or ``"cpu"`` — forwarded to Stage 1's ``--device``.
-    parallel : bool
-        Opt-in batched detect+ReID + prefetch decode (forwarded as ``--parallel``).
-    batch_size : int
-        Frames per batch in parallel mode (forwarded as ``--batch-size`` only
-        when ``parallel`` is set).
+    detector_ckpt : str | None
+        YOLOv11 detector checkpoint; forwarded as ``--detector-ckpt``.  ``None``
+        -> ``checkpoints/yolov11l.pt``.
     fp16 : bool
         Half-precision detector inference (forwarded as ``--fp16``).  This is the
-        main GPU throughput lever — batching does NOT speed up an already
-        compute-saturated detector, but FP16 typically gives ~1.5-2x.
+        main GPU throughput lever; FP16 typically gives ~1.5-2x.
     fuse : bool
         Fuse detector conv+BN layers (forwarded as ``--fuse``); small free gain.
 
     Stage 2 refine params (forwarded with the same names Stage 2 declares)
     ---------------------------------------------------------------------
-    use_split, use_connect : bool
-        Default to the FULL pipeline (BOTH True).  Disable one via
-        ``--no-split`` / ``--no-connect`` on the CLI; at least one must remain.
     eps, min_samples, max_k, min_len, spatial_factor, merge_dist_thres
-        Refine algorithm params (same defaults as Stage 2's parser).
-    fast_merge : bool
-        Use Stage 2's exact batched connect/merge (``--fast_merge``) instead of
-        the original per-pair GPU path. Same output (up to float rounding),
-        orders of magnitude faster on the connect step. Only affects
-        ``--use_connect``.
+        Refine algorithm params (same defaults as Stage 2's parser).  Stage 2
+        always runs the full split + connect pipeline.
 
     Force
     -----
@@ -107,47 +97,31 @@ class RunOptions:
         self,
         *,
         device: str = "gpu",
-        detector: str = "yolov11",
         detector_ckpt: "Optional[str]" = None,
-        parallel: bool = False,
-        batch_size: int = 8,
         fp16: bool = False,
         fuse: bool = False,
-        use_split: bool = True,
-        use_connect: bool = True,
         eps: float = 0.6,
         min_samples: int = 10,
         max_k: int = 3,
         min_len: int = 100,
         spatial_factor: float = 1.0,
         merge_dist_thres: float = 0.4,
-        fast_merge: bool = False,
         force_stage1: bool = False,
         force_stage2: bool = False,
         artifacts_dir: "Optional[str]" = None,
     ) -> None:
         self.device = device
-        self.detector = detector
         if detector_ckpt is None:
-            detector_ckpt = (
-                "checkpoints/best_ckpt.pth.tar"
-                if detector == "yolox"
-                else "checkpoints/yolov11l.pt"
-            )
+            detector_ckpt = "checkpoints/yolov11l.pt"
         self.detector_ckpt = detector_ckpt
-        self.parallel = parallel
-        self.batch_size = batch_size
         self.fp16 = fp16
         self.fuse = fuse
-        self.use_split = use_split
-        self.use_connect = use_connect
         self.eps = eps
         self.min_samples = min_samples
         self.max_k = max_k
         self.min_len = min_len
         self.spatial_factor = spatial_factor
         self.merge_dist_thres = merge_dist_thres
-        self.fast_merge = fast_merge
         self.force_stage1 = force_stage1
         self.force_stage2 = force_stage2
         self.artifacts_dir = artifacts_dir
@@ -183,10 +157,9 @@ class SubprocessRunner:
 def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -> List[str]:
     """Build the Stage-1 argv (to run with ``cwd=STAGE1_CWD``).
 
-    Always passes the absolute ``--video`` / ``--artifacts-dir``.  Forwards
-    ``--device`` always; ``--parallel --batch-size N`` only when parallel;
-    ``--fp16`` / ``--fuse`` only when enabled; and ``--force`` only when Stage 1
-    is forced.
+    Always passes the absolute ``--video`` / ``--artifacts-dir``, ``--device``,
+    and ``--detector-ckpt``.  Forwards ``--fp16`` / ``--fuse`` only when enabled,
+    and ``--force`` only when Stage 1 is forced.
     """
     cmd: List[str] = [
         sys.executable,
@@ -194,11 +167,8 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
         "--video", video_abs,
         "--artifacts-dir", artifacts_abs,
         "--device", opts.device,
-        "--detector", opts.detector,
         "--detector-ckpt", opts.detector_ckpt,
     ]
-    if opts.parallel:
-        cmd += ["--parallel", "--batch-size", str(opts.batch_size)]
     if opts.fp16:
         cmd += ["--fp16"]
     if opts.fuse:
@@ -211,21 +181,15 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
 def build_stage2_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -> List[str]:
     """Build the Stage-2 argv (to run with ``cwd=STAGE2_CWD``).
 
-    Always passes the absolute ``--video`` / ``--artifacts-dir``.  Forwards the
-    refine params; ``--use_split`` / ``--use_connect`` are store_true flags so
-    they are added only when enabled.  ``--force`` only when Stage 2 is forced.
+    Always passes the absolute ``--video`` / ``--artifacts-dir`` and the refine
+    params (Stage 2 always runs the full split + connect pipeline).  ``--force``
+    only when Stage 2 is forced.
     """
     cmd: List[str] = [
         sys.executable,
         STAGE2_SCRIPT,
         "--video", video_abs,
         "--artifacts-dir", artifacts_abs,
-    ]
-    if opts.use_split:
-        cmd += ["--use_split"]
-    if opts.use_connect:
-        cmd += ["--use_connect"]
-    cmd += [
         "--eps", str(opts.eps),
         "--min_samples", str(opts.min_samples),
         "--max_k", str(opts.max_k),
@@ -233,8 +197,6 @@ def build_stage2_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
         "--spatial_factor", str(opts.spatial_factor),
         "--merge_dist_thres", str(opts.merge_dist_thres),
     ]
-    if opts.fast_merge:
-        cmd += ["--fast_merge"]
     if opts.force_stage2:
         cmd += ["--force"]
     return cmd

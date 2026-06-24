@@ -1,28 +1,23 @@
 """
-CPU-only unit tests for Stage-2's step-decision orchestration (Task 4).
+CPU-only unit tests for Stage-2's refine orchestration.
 
 Runs with plain python (numpy only) — NO torch / sklearn / scipy / matplotlib /
-seaborn / loguru.  The refine ALGORITHM functions need those heavy deps, so this
-test does NOT import ``refine_tracklets``; instead it drives
+seaborn / loguru.  The refine ALGORITHM functions (split / spatial) need those
+heavy deps, so this test does NOT import ``refine_tracklets``; instead it drives
 ``stage2_refine.run_refine`` with INJECTED stub callables (a ``RefineDeps``
-bundle) and asserts the step-decision logic:
+bundle) plus the real, numpy-only ``_fast_connect`` connect step, and asserts:
 
-  * ``--use_split`` only      -> split called, merge NOT called; save gets the
-                                 split result.
-  * ``--use_connect`` only    -> split NOT called, merge called.
-  * both                      -> split THEN merge (split feeds merge).
-  * neither                   -> raises ValueError.
-  * save target is the contract ``refined_txt`` path.
+  * the full flow runs split THEN connect (fast) THEN save;
+  * spatial constraints are computed from the ORIGINAL tracklets + factor;
+  * split params are forwarded by name;
+  * the save target is the contract ``refined_txt`` path;
+  * ``_fast_connect`` merges/keeps tracklets correctly (feature distance,
+    temporal overlap, spatial gate).
 
 ``stage2_refine`` imports cleanly here because it only imports ``pipeline.*``
 (numpy/stdlib) at module level; ``refine_tracklets`` is imported lazily inside
-``_build_deps`` / ``main`` (never reached by these tests).
-
-Optionally, if torch+sklearn+scipy+matplotlib+seaborn+loguru all happen to be
-importable, a tiny real end-to-end refine on a synthetic 2-tracklet pkl runs and
-asserts a non-empty refined.txt is written.  It SKIPS gracefully (does not fail)
-when any dep is missing — which is the case on this host (loguru/matplotlib/
-seaborn absent).
+``_build_deps`` / ``main`` (never reached by these tests, except the optional
+end-to-end one which SKIPS gracefully when the heavy deps are missing).
 
 Run with:
     python pipeline/tests/test_stage2_refine.py
@@ -63,7 +58,7 @@ RefineDeps = _s2.RefineDeps
 
 
 # ---------------------------------------------------------------------------
-# Minimal test runner (matches test_stage1_parallel.py style; no pytest)
+# Minimal test runner (no pytest)
 # ---------------------------------------------------------------------------
 _FAILURES: list[str] = []
 _PASSED: int = 0
@@ -91,202 +86,9 @@ def run_test(name: str, fn) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Recording stubs for the injected refine callables
+# Minimal Tracklet stand-in for _fast_connect (numpy-only)
 # ---------------------------------------------------------------------------
-class _Recorder:
-    """Records which refine steps were called, in order, with their inputs.
-
-    Each stub returns a sentinel dict so we can prove which object flowed into
-    save_results (the split dict vs the merged dict).
-    """
-
-    def __init__(self):
-        self.calls = []                 # ordered list of step names
-        self.spatial_arg = None
-        self.split_input = None
-        self.split_output = {"SPLIT": 1}
-        self.dist_input = None
-        self.merge_input = None         # tracklets passed to merge
-        self.merge_kwargs = None
-        self.merge_output = {"MERGED": 1}
-        self.saved_path = None
-        self.saved_obj = None
-
-    # get_spatial_constraints(tid2track, factor) -> (max_x, max_y)
-    def get_spatial_constraints(self, tid2track, factor):
-        self.calls.append("spatial")
-        self.spatial_arg = (tid2track, factor)
-        return (111.0, 222.0)
-
-    # split_tracklets(tmp, eps, max_k, min_samples, len_thres) -> dict
-    def split_tracklets(self, tmp, eps=None, max_k=None, min_samples=None, len_thres=None):
-        self.calls.append("split")
-        self.split_input = tmp
-        self.split_params = dict(eps=eps, max_k=max_k, min_samples=min_samples, len_thres=len_thres)
-        return self.split_output
-
-    # get_distance_matrix(tracklets) -> ndarray
-    def get_distance_matrix(self, tracklets):
-        self.calls.append("dist")
-        self.dist_input = tracklets
-        return np.zeros((2, 2), dtype=np.float32)
-
-    # merge_tracklets(tracklets, seq2Dist, Dist, seq_name, max_x_range, max_y_range, merge_dist_thres)
-    def merge_tracklets(self, tracklets, seq2Dist, Dist, seq_name=None,
-                        max_x_range=None, max_y_range=None, merge_dist_thres=None):
-        self.calls.append("merge")
-        self.merge_input = tracklets
-        self.merge_kwargs = dict(
-            seq2Dist=seq2Dist, seq_name=seq_name, max_x_range=max_x_range,
-            max_y_range=max_y_range, merge_dist_thres=merge_dist_thres,
-        )
-        return self.merge_output
-
-    # save_results(out_path, tracklets) -> None
-    def save_results(self, out_path, tracklets):
-        self.calls.append("save")
-        self.saved_path = out_path
-        self.saved_obj = tracklets
-
-    # check_spatial_constraints(trk1, trk2, max_x, max_y) -> bool (fast path only)
-    def check_spatial_constraints(self, trk1, trk2, max_x_range, max_y_range):
-        self.calls.append("spatial_check")
-        return True
-
-
-def _deps_from(rec: _Recorder) -> "RefineDeps":
-    return RefineDeps(
-        get_spatial_constraints=rec.get_spatial_constraints,
-        split_tracklets=rec.split_tracklets,
-        get_distance_matrix=rec.get_distance_matrix,
-        merge_tracklets=rec.merge_tracklets,
-        save_results=rec.save_results,
-        check_spatial_constraints=rec.check_spatial_constraints,
-    )
-
-
-def _params(use_split, use_connect, fast_merge=False):
-    return {
-        "use_split": use_split,
-        "use_connect": use_connect,
-        "min_len": 100,
-        "eps": 0.6,
-        "min_samples": 10,
-        "max_k": 3,
-        "spatial_factor": 1.0,
-        "merge_dist_thres": 0.4,
-        "fast_merge": fast_merge,
-    }
-
-
-_TMP_TRACKLETS = {1: object(), 2: object(), 3: object()}  # opaque {tid: Tracklet}
-_REFINED_TXT = "/contract/path/02_refine/refined.txt"
-
-
-# ===========================================================================
-# Step-decision tests
-# ===========================================================================
-def test_split_only_no_merge():
-    rec = _Recorder()
-    counts = run_refine(_TMP_TRACKLETS, _REFINED_TXT, _params(True, False),
-                        _deps_from(rec), seq_name="clip")
-
-    assert "split" in rec.calls, rec.calls
-    assert "merge" not in rec.calls, "merge must NOT run for --use_split only"
-    assert "dist" not in rec.calls, "distance matrix must NOT run without merge"
-    # save gets the SPLIT result (deviation: not merged).
-    assert rec.saved_obj is rec.split_output, "save must receive the split result"
-    assert rec.saved_path == _REFINED_TXT, rec.saved_path
-    # counts reflect split sizes (stub split output has len 1).
-    assert counts["n_tracklets_in"] == 3, counts
-    assert counts["n_tracklets_after_split"] == len(rec.split_output), counts
-    assert counts["n_tracklets_out"] == len(rec.split_output), counts
-
-
-def test_connect_only_no_split():
-    rec = _Recorder()
-    counts = run_refine(_TMP_TRACKLETS, _REFINED_TXT, _params(False, True),
-                        _deps_from(rec), seq_name="clip")
-
-    assert "split" not in rec.calls, "split must NOT run for --use_connect only"
-    assert "dist" in rec.calls and "merge" in rec.calls, rec.calls
-    # When not splitting, the merge input is the ORIGINAL tmp tracklets.
-    assert rec.merge_input is _TMP_TRACKLETS, "merge must run on the original tracklets"
-    assert rec.dist_input is _TMP_TRACKLETS
-    assert rec.saved_obj is rec.merge_output, "save must receive the merged result"
-    assert rec.saved_path == _REFINED_TXT
-    # after_split == in (no split happened).
-    assert counts["n_tracklets_after_split"] == 3, counts
-    assert counts["n_tracklets_out"] == len(rec.merge_output), counts
-
-
-def test_both_split_then_merge():
-    rec = _Recorder()
-    run_refine(_TMP_TRACKLETS, _REFINED_TXT, _params(True, True),
-               _deps_from(rec), seq_name="clip")
-
-    # Order: spatial, split, dist, merge, save.
-    assert rec.calls == ["spatial", "split", "dist", "merge", "save"], rec.calls
-    # split feeds merge: merge runs on the split OUTPUT, not the original.
-    assert rec.split_input is _TMP_TRACKLETS
-    assert rec.merge_input is rec.split_output, "split output must feed merge"
-    assert rec.dist_input is rec.split_output
-    assert rec.saved_obj is rec.merge_output
-
-
-def test_neither_raises():
-    rec = _Recorder()
-    raised = False
-    try:
-        run_refine(_TMP_TRACKLETS, _REFINED_TXT, _params(False, False),
-                   _deps_from(rec), seq_name="clip")
-    except ValueError:
-        raised = True
-    assert raised, "neither --use_split nor --use_connect must raise ValueError"
-    # No algorithm step should have run before the raise.
-    assert rec.calls == [], rec.calls
-
-
-def test_save_target_is_contract_path():
-    # Explicitly assert across all enabled-flag combos that save target == refined_txt.
-    for us, uc in [(True, False), (False, True), (True, True)]:
-        rec = _Recorder()
-        run_refine(_TMP_TRACKLETS, _REFINED_TXT, _params(us, uc),
-                   _deps_from(rec), seq_name="clip")
-        assert rec.saved_path == _REFINED_TXT, (us, uc, rec.saved_path)
-
-
-def test_spatial_uses_original_and_factor():
-    # spatial constraints computed from original tmp with the spatial_factor,
-    # and the (max_x, max_y) are threaded into merge.
-    rec = _Recorder()
-    p = _params(True, True)
-    p["spatial_factor"] = 2.5
-    run_refine(_TMP_TRACKLETS, _REFINED_TXT, p, _deps_from(rec), seq_name="clip")
-    assert rec.spatial_arg[0] is _TMP_TRACKLETS, "spatial uses ORIGINAL tracklets"
-    assert rec.spatial_arg[1] == 2.5, rec.spatial_arg
-    # merge receives the spatial ranges + seq_name + threshold.
-    assert rec.merge_kwargs["max_x_range"] == 111.0
-    assert rec.merge_kwargs["max_y_range"] == 222.0
-    assert rec.merge_kwargs["seq_name"] == "clip"
-    assert rec.merge_kwargs["merge_dist_thres"] == 0.4
-    assert rec.merge_kwargs["seq2Dist"] == {}, "merge gets an empty seq2Dist debug dict"
-
-
-def test_split_params_forwarded():
-    rec = _Recorder()
-    p = _params(True, False)
-    p.update(eps=0.42, max_k=7, min_samples=4, min_len=33)
-    run_refine(_TMP_TRACKLETS, _REFINED_TXT, p, _deps_from(rec), seq_name="clip")
-    assert rec.split_params == dict(eps=0.42, max_k=7, min_samples=4, len_thres=33), rec.split_params
-
-
-# ===========================================================================
-# Fast connect/merge (_fast_connect) — CPU-only, numpy + stubbed spatial gate
-# ===========================================================================
 class _FakeTrack:
-    """Minimal Tracklet stand-in for _fast_connect (numpy-only)."""
-
     def __init__(self, track_id, times, feats, bboxes=None):
         self.track_id = track_id
         self.parent_id = track_id
@@ -299,26 +101,142 @@ class _FakeTrack:
         self.scores = [1.0 for _ in times]
 
 
-def _fast_deps(spatial_ok=True):
-    """Deps bundle for the fast path: only check_spatial_constraints is used.
+_V0 = [1.0, 0.0, 0.0, 0.0]   # one unit direction
+_V1 = [0.0, 1.0, 0.0, 0.0]   # an orthogonal direction (cosine distance 1.0)
 
-    The slow callables raise if touched, proving the fast path never calls them.
+
+def _params(**overrides):
+    p = {
+        "min_len": 100,
+        "eps": 0.6,
+        "min_samples": 10,
+        "max_k": 3,
+        "spatial_factor": 1.0,
+        "merge_dist_thres": 0.4,
+    }
+    p.update(overrides)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Recorder stubs for the injected refine callables
+# ---------------------------------------------------------------------------
+class _Recorder:
+    """Records the orchestration steps + their inputs.
+
+    ``split_tracklets`` returns a caller-supplied dict of real ``_FakeTrack``
+    objects so the real, numpy-only ``_fast_connect`` connect step can run over
+    them.  ``check_spatial_constraints`` is the gate ``_fast_connect`` calls.
     """
-    def _forbidden(*_a, **_k):  # noqa: ANN002, ANN003
-        raise AssertionError("slow connect path must not run under fast_merge")
 
+    def __init__(self, split_output, spatial_ok=True):
+        self.calls = []
+        self.spatial_arg = None
+        self.split_input = None
+        self.split_params = None
+        self.split_output = split_output
+        self.spatial_ok = spatial_ok
+        self.saved_path = None
+        self.saved_obj = None
+
+    def get_spatial_constraints(self, tid2track, factor):
+        self.calls.append("spatial")
+        self.spatial_arg = (tid2track, factor)
+        return (1e9, 1e9)
+
+    def split_tracklets(self, tmp, eps=None, max_k=None, min_samples=None, len_thres=None):
+        self.calls.append("split")
+        self.split_input = tmp
+        self.split_params = dict(eps=eps, max_k=max_k, min_samples=min_samples, len_thres=len_thres)
+        return self.split_output
+
+    def check_spatial_constraints(self, trk1, trk2, max_x_range, max_y_range):
+        self.calls.append("spatial_check")
+        return self.spatial_ok
+
+    def save_results(self, out_path, tracklets):
+        self.calls.append("save")
+        self.saved_path = out_path
+        self.saved_obj = tracklets
+
+
+def _deps_from(rec: _Recorder) -> "RefineDeps":
     return RefineDeps(
-        get_spatial_constraints=lambda t, f: (1e9, 1e9),
-        split_tracklets=_forbidden,
-        get_distance_matrix=_forbidden,
-        merge_tracklets=_forbidden,
-        save_results=lambda p, o: None,
-        check_spatial_constraints=lambda a, b, mx, my: spatial_ok,
+        get_spatial_constraints=rec.get_spatial_constraints,
+        split_tracklets=rec.split_tracklets,
+        check_spatial_constraints=rec.check_spatial_constraints,
+        save_results=rec.save_results,
     )
 
 
-_V0 = [1.0, 0.0, 0.0, 0.0]   # one unit direction
-_V1 = [0.0, 1.0, 0.0, 0.0]   # an orthogonal direction (cosine distance 1.0)
+_REFINED_TXT = "/contract/path/02_refine/refined.txt"
+
+
+# ===========================================================================
+# Orchestration tests (split -> fast connect -> save)
+# ===========================================================================
+def test_full_flow_split_then_connect_then_save():
+    # split returns two identical non-overlapping tracklets -> connect merges to 1.
+    split_out = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
+    }
+    tmp = {1: object(), 2: object(), 3: object()}  # original (only len/identity used)
+    rec = _Recorder(split_output=split_out, spatial_ok=True)
+    counts = run_refine(tmp, _REFINED_TXT, _params(), _deps_from(rec), seq_name="clip")
+
+    # Order: spatial first, split second, save last; the connect step invokes the
+    # spatial gate in between.
+    assert rec.calls[0] == "spatial", rec.calls
+    assert rec.calls[1] == "split", rec.calls
+    assert rec.calls[-1] == "save", rec.calls
+    assert "spatial_check" in rec.calls, rec.calls
+    # split feeds connect: the ORIGINAL tmp is what split saw.
+    assert rec.split_input is tmp, "split must run on the original tracklets"
+    # save receives the MERGED result (one tracklet).
+    assert rec.saved_path == _REFINED_TXT, rec.saved_path
+    assert len(rec.saved_obj) == 1, rec.saved_obj
+    assert counts["n_tracklets_in"] == 3, counts
+    assert counts["n_tracklets_after_split"] == 2, counts
+    assert counts["n_tracklets_out"] == 1, counts
+
+
+def test_spatial_uses_original_and_factor():
+    split_out = {1: _FakeTrack(1, range(0, 5), [_V0] * 5)}
+    tmp = {1: object(), 2: object()}
+    rec = _Recorder(split_output=split_out)
+    run_refine(tmp, _REFINED_TXT, _params(spatial_factor=2.5), _deps_from(rec), seq_name="clip")
+    assert rec.spatial_arg[0] is tmp, "spatial uses ORIGINAL tracklets"
+    assert rec.spatial_arg[1] == 2.5, rec.spatial_arg
+
+
+def test_split_params_forwarded():
+    split_out = {1: _FakeTrack(1, range(0, 5), [_V0] * 5)}
+    rec = _Recorder(split_output=split_out)
+    p = _params(eps=0.42, max_k=7, min_samples=4, min_len=33)
+    run_refine({1: object()}, _REFINED_TXT, p, _deps_from(rec), seq_name="clip")
+    assert rec.split_params == dict(eps=0.42, max_k=7, min_samples=4, len_thres=33), rec.split_params
+
+
+def test_save_target_is_contract_path():
+    split_out = {1: _FakeTrack(1, range(0, 5), [_V0] * 5)}
+    rec = _Recorder(split_output=split_out)
+    run_refine({1: object()}, _REFINED_TXT, _params(), _deps_from(rec), seq_name="clip")
+    assert rec.saved_path == _REFINED_TXT, rec.saved_path
+
+
+# ===========================================================================
+# Fast connect/merge (_fast_connect) — CPU-only, numpy + stubbed spatial gate
+# ===========================================================================
+def _fast_deps(spatial_ok=True):
+    """Deps bundle for direct _fast_connect calls: only check_spatial_constraints
+    is used; the other callables are simple no-ops."""
+    return RefineDeps(
+        get_spatial_constraints=lambda t, f: (1e9, 1e9),
+        split_tracklets=lambda *a, **k: None,
+        check_spatial_constraints=lambda a, b, mx, my: spatial_ok,
+        save_results=lambda p, o: None,
+    )
 
 
 def test_fast_merges_identical_nonoverlapping():
@@ -383,29 +301,6 @@ def test_fast_chain_merges_only_similar():
     assert lens == [5, 10], lens   # the orthogonal one (5) + the merged pair (10)
 
 
-def test_run_refine_fast_path_routing():
-    # fast_merge=True with use_connect must use _fast_connect (NOT the slow
-    # get_distance_matrix / merge_tracklets, which raise if called).
-    trks = {
-        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
-        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
-    }
-    saved = {}
-
-    def _save(path, obj):
-        saved["path"] = path
-        saved["obj"] = obj
-
-    deps = _fast_deps(spatial_ok=True)
-    deps.save_results = _save  # capture what gets written
-    counts = run_refine(trks, "/contract/refined.txt",
-                        _params(use_split=False, use_connect=True, fast_merge=True),
-                        deps, seq_name="clip")
-    assert saved["path"] == "/contract/refined.txt", saved
-    assert len(saved["obj"]) == 1, "fast path should have merged to one tracklet"
-    assert counts["n_tracklets_in"] == 2 and counts["n_tracklets_out"] == 1, counts
-
-
 # ===========================================================================
 # Optional real end-to-end refine (SKIPS gracefully when heavy deps missing)
 # ===========================================================================
@@ -426,7 +321,7 @@ def test_optional_end_to_end_real_refine():
     # (Only reached when all heavy deps are present, e.g. on Colab.)
     if str(_GTA_LINK_DIR) not in sys.path:
         sys.path.insert(0, str(_GTA_LINK_DIR))
-    import refine_tracklets  # noqa: WPS433
+    import refine_tracklets  # noqa: F401, WPS433
     from Tracklet import Tracklet  # noqa: WPS433
 
     rng = np.random.default_rng(0)
@@ -443,7 +338,7 @@ def test_optional_end_to_end_real_refine():
     deps = _s2._build_deps()
     with tempfile.TemporaryDirectory() as td:
         out_path = str(Path(td) / "refined.txt")
-        counts = run_refine(tmp, out_path, _params(True, True), deps, seq_name="synthetic")
+        counts = run_refine(tmp, out_path, _params(), deps, seq_name="synthetic")
         assert Path(out_path).is_file(), "refined.txt must be written"
         rows = Path(out_path).read_text().strip().splitlines()
         assert len(rows) >= 1, "refined.txt should have at least one MOT row"
@@ -454,87 +349,23 @@ def test_optional_end_to_end_real_refine():
     print("    real refine wrote {} rows".format(len(rows)))
 
 
-def test_optional_fast_equals_slow_end_to_end():
-    """Slow path == fast path on a synthetic clip (skips if heavy deps missing).
-
-    This is the equivalence proof for ``--fast_merge``: run the real
-    ``get_distance_matrix`` + ``merge_tracklets`` and the batched
-    ``_fast_connect`` over the SAME input and assert byte-identical
-    ``refined.txt``.  Distances are unambiguous (0 for mergeable pairs, 1
-    otherwise — well clear of the 0.4 threshold) so the float32-vs-float64
-    rounding caveat cannot flip a decision here.
-    """
-    import copy
-
-    if not _heavy_deps_available():
-        print("    SKIP (heavy deps unavailable: refine_tracklets cannot import)")
-        return
-
-    if str(_GTA_LINK_DIR) not in sys.path:
-        sys.path.insert(0, str(_GTA_LINK_DIR))
-    from Tracklet import Tracklet  # noqa: WPS433
-
-    bbox = [100.0, 100.0, 30.0, 60.0]  # identical box -> spatial gate always passes
-
-    def _mk(tid, frames, vec):
-        feats = [np.asarray(vec, dtype=np.float32) for _ in frames]
-        scores = [1.0 for _ in frames]
-        bboxes = [list(bbox) for _ in frames]
-        return Tracklet(tid, list(frames), scores, bboxes, feats=feats)
-
-    # A+B identical (merge); C+D identical (merge); the two groups orthogonal.
-    def _build():
-        return {
-            1: _mk(1, range(0, 10), _V0),
-            2: _mk(2, range(20, 30), _V0),
-            3: _mk(3, range(40, 50), _V1),
-            4: _mk(4, range(60, 70), _V1),
-        }
-
-    deps = _s2._build_deps()
-    with tempfile.TemporaryDirectory() as td:
-        slow_path = str(Path(td) / "slow.txt")
-        fast_path = str(Path(td) / "fast.txt")
-        run_refine(copy.deepcopy(_build()), slow_path,
-                   _params(use_split=False, use_connect=True, fast_merge=False),
-                   deps, seq_name="synthetic")
-        run_refine(copy.deepcopy(_build()), fast_path,
-                   _params(use_split=False, use_connect=True, fast_merge=True),
-                   deps, seq_name="synthetic")
-        slow_txt = Path(slow_path).read_text()
-        fast_txt = Path(fast_path).read_text()
-        assert slow_txt == fast_txt, (
-            "fast_merge output must byte-match the slow path on unambiguous "
-            "input.\n--- slow ---\n{}\n--- fast ---\n{}".format(slow_txt, fast_txt)
-        )
-        # And the merges actually happened: 4 tracklets -> 2 ids.
-        ids = {row.split(",")[1] for row in slow_txt.strip().splitlines()}
-        assert len(ids) == 2, ids
-    print("    fast == slow (4 tracklets -> 2 merged ids), refined.txt identical")
-
-
 _TESTS = [
-    ("run_refine: --use_split only -> split, no merge, save split", test_split_only_no_merge),
-    ("run_refine: --use_connect only -> merge, no split", test_connect_only_no_split),
-    ("run_refine: both -> split THEN merge (split feeds merge)", test_both_split_then_merge),
-    ("run_refine: neither -> raises ValueError", test_neither_raises),
-    ("run_refine: save target is the contract refined_txt", test_save_target_is_contract_path),
-    ("run_refine: spatial from original+factor, threaded into merge", test_spatial_uses_original_and_factor),
+    ("run_refine: split -> connect -> save full flow", test_full_flow_split_then_connect_then_save),
+    ("run_refine: spatial from original + factor", test_spatial_uses_original_and_factor),
     ("run_refine: split params forwarded by name", test_split_params_forwarded),
+    ("run_refine: save target is the contract refined_txt", test_save_target_is_contract_path),
     ("fast_connect: identical non-overlapping tracklets merge", test_fast_merges_identical_nonoverlapping),
     ("fast_connect: orthogonal tracklets stay apart", test_fast_keeps_orthogonal_apart),
     ("fast_connect: temporal overlap blocks merge", test_fast_overlap_blocks_merge),
     ("fast_connect: spatial-gate veto blocks merge", test_fast_spatial_gate_blocks_merge),
     ("fast_connect: chain merges only the similar pair", test_fast_chain_merges_only_similar),
-    ("run_refine: fast_merge routes to _fast_connect (slow path not called)", test_run_refine_fast_path_routing),
     ("run_refine: optional real end-to-end refine (skips w/o deps)", test_optional_end_to_end_real_refine),
-    ("run_refine: optional fast==slow equivalence (skips w/o deps)", test_optional_fast_equals_slow_end_to_end),
 ]
 
 
 def main() -> int:
     print("=" * 60)
-    print("stage2 refine step-decision unit tests (CPU-only, stubbed)")
+    print("stage2 refine orchestration unit tests (CPU-only, stubbed)")
     print("=" * 60)
     for test_name, fn in _TESTS:
         run_test(test_name, fn)
