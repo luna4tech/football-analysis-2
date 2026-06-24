@@ -3,9 +3,10 @@ pipeline.__main__ — the ``python -m pipeline ...`` CLI.
 
 Subcommand
 ----------
-run      Chain Stage 1 (tracking) then Stage 2 (refine) as subprocesses over the
-         shared artifact contract, with caching/force, and write an aggregated
-         profile summary.  Stage 2 always runs the full split + connect refine.
+run      Chain Stage 1 (tracking), Stage 2 (refine), then Stage 3 (team
+         assignment) as subprocesses over the shared artifact contract, with
+         caching/force, and write an aggregated profile summary.  Stage 2 always
+         runs the full split + connect refine.
 
 Caching caveat (re-stated in --help)
 ------------------------------------
@@ -42,11 +43,12 @@ _CACHE_CAVEAT = (
 def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
     p = subparsers.add_parser(
         "run",
-        help="run the full pipeline (Stage 1 then Stage 2) as subprocesses",
+        help="run the full pipeline (Stage 1, Stage 2, Stage 3) as subprocesses",
         description=(
-            "Chain Stage 1 (YOLOv11 tracking) then Stage 2 (GtaLink refine) as "
-            "subprocesses over the shared artifact contract. Stage 2 always runs "
-            "the full split + connect refine. " + _CACHE_CAVEAT
+            "Chain Stage 1 (YOLOv11 tracking), Stage 2 (GtaLink refine), then "
+            "Stage 3 (team assignment) as subprocesses over the shared artifact "
+            "contract. Stage 2 always runs the full split + connect refine. "
+            + _CACHE_CAVEAT
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -107,7 +109,7 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         dest="force_all",
         action="store_true",
         default=False,
-        help="force recompute of BOTH stages",
+        help="force recompute of ALL stages",
     )
     gf.add_argument(
         "--force-stage1",
@@ -122,6 +124,13 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         action="store_true",
         default=False,
         help="force recompute of Stage 2 only",
+    )
+    gf.add_argument(
+        "--force-stage3",
+        dest="force_stage3",
+        action="store_true",
+        default=False,
+        help="force recompute of Stage 3 only",
     )
 
 
@@ -139,6 +148,7 @@ def _run_from_args(args: argparse.Namespace) -> int:
         merge_dist_thres=args.merge_dist_thres,
         force_stage1=args.force_all or args.force_stage1,
         force_stage2=args.force_all or args.force_stage2,
+        force_stage3=args.force_all or args.force_stage3,
         artifacts_dir=args.artifacts_dir,
     )
     try:
@@ -152,7 +162,8 @@ def _run_from_args(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pipeline",
-        description="Two-stage tracking pipeline (YOLOv11 tracking + GtaLink refine).",
+        description="Three-stage tracking pipeline (YOLOv11 tracking + GtaLink "
+        "refine + team assignment).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_run_parser(subparsers)

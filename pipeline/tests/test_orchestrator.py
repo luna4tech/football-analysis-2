@@ -27,6 +27,7 @@ from pipeline.orchestrator import (
     StageError,
     build_stage1_command,
     build_stage2_command,
+    build_stage3_command,
     run,
 )
 
@@ -159,34 +160,54 @@ def test_stage2_refine_params_forwarded():
 
 
 # ===========================================================================
+# Stage-3 command wiring
+# ===========================================================================
+def test_stage3_command():
+    opts = RunOptions()
+    cmd = build_stage3_command("/abs/clip.mp4", "/abs/artifacts", opts)
+    assert cmd[0] == sys.executable, cmd
+    assert cmd[1] == "pipeline/team_assignment.py", cmd
+    assert _value_after(cmd, "--video") == "/abs/clip.mp4", cmd
+    assert _value_after(cmd, "--artifacts-dir") == "/abs/artifacts", cmd
+    # default: not forced.
+    assert "--force" not in cmd, cmd
+
+
+def test_stage3_force_adds_force():
+    opts = RunOptions(force_stage3=True)
+    cmd = build_stage3_command("/abs/clip.mp4", "/abs/artifacts", opts)
+    assert "--force" in cmd, cmd
+
+
+# ===========================================================================
 # Orchestrated run with the fake runner
 # ===========================================================================
-def test_run_two_stages_cwd_and_abs_paths():
+def test_run_three_stages_cwd_and_abs_paths():
     with tempfile.TemporaryDirectory() as tmp:
         video, artifacts = _make_env(tmp)
-        runner = FakeRunner([0, 0])
+        runner = FakeRunner([0, 0, 0])
         run(video, RunOptions(artifacts_dir=artifacts), runner=runner)
 
-        assert len(runner.calls) == 2, "both stages must run on success"
-        (cmd1, cwd1), (cmd2, cwd2) = runner.calls
+        assert len(runner.calls) == 3, "all three stages must run on success"
+        (cmd1, cwd1), (cmd2, cwd2), (cmd3, cwd3) = runner.calls
 
-        # Stage 1 in Deep-EIoU/Deep-EIoU; Stage 2 in gta-link.
+        # Stage 1 in Deep-EIoU/Deep-EIoU; Stage 2 in gta-link; Stage 3 in repo root.
         assert cwd1 == str(orchestrator.STAGE1_CWD), cwd1
         assert cwd2 == str(orchestrator.STAGE2_CWD), cwd2
+        assert cwd3 == str(orchestrator.STAGE3_CWD), cwd3
         assert cmd1[1] == "tools/stage1_track.py", cmd1
         assert cmd2[1] == "stage2_refine.py", cmd2
+        assert cmd3[1] == "pipeline/team_assignment.py", cmd3
 
-        # SAME absolute video + artifacts dir to BOTH stages.
-        v1 = _value_after(cmd1, "--video")
-        v2 = _value_after(cmd2, "--video")
-        a1 = _value_after(cmd1, "--artifacts-dir")
-        a2 = _value_after(cmd2, "--artifacts-dir")
-        assert v1 == v2, (v1, v2)
-        assert a1 == a2, (a1, a2)
-        assert Path(v1).is_absolute(), v1
-        assert Path(a1).is_absolute(), a1
-        assert v1 == str(Path(video).resolve()), v1
-        assert a1 == str(Path(artifacts).resolve()), a1
+        # SAME absolute video + artifacts dir to ALL stages.
+        vs = [_value_after(c, "--video") for c in (cmd1, cmd2, cmd3)]
+        as_ = [_value_after(c, "--artifacts-dir") for c in (cmd1, cmd2, cmd3)]
+        assert vs[0] == vs[1] == vs[2], vs
+        assert as_[0] == as_[1] == as_[2], as_
+        assert Path(vs[0]).is_absolute(), vs[0]
+        assert Path(as_[0]).is_absolute(), as_[0]
+        assert vs[0] == str(Path(video).resolve()), vs[0]
+        assert as_[0] == str(Path(artifacts).resolve()), as_[0]
 
 
 def test_run_stage2_gets_refine_params():
@@ -201,32 +222,44 @@ def test_run_stage2_gets_refine_params():
         assert _value_after(cmd2, "--merge_dist_thres") == "0.4", cmd2
 
 
-def test_force_all_forces_both_stages():
+def test_force_all_forces_all_stages():
     with tempfile.TemporaryDirectory() as tmp:
         video, artifacts = _make_env(tmp)
-        runner = FakeRunner([0, 0])
-        opts = RunOptions(artifacts_dir=artifacts, force_stage1=True, force_stage2=True)
+        runner = FakeRunner([0, 0, 0])
+        opts = RunOptions(
+            artifacts_dir=artifacts,
+            force_stage1=True,
+            force_stage2=True,
+            force_stage3=True,
+        )
         run(video, opts, runner=runner)
-        cmd1, cmd2 = runner.calls[0][0], runner.calls[1][0]
+        cmd1, cmd2, cmd3 = runner.calls[0][0], runner.calls[1][0], runner.calls[2][0]
         assert "--force" in cmd1, "Stage 1 must be forced"
         assert "--force" in cmd2, "Stage 2 must be forced"
+        assert "--force" in cmd3, "Stage 3 must be forced"
 
 
-def test_force_stage2_only():
+def test_force_stage3_only():
     with tempfile.TemporaryDirectory() as tmp:
         video, artifacts = _make_env(tmp)
-        runner = FakeRunner([0, 0])
-        opts = RunOptions(artifacts_dir=artifacts, force_stage1=False, force_stage2=True)
+        runner = FakeRunner([0, 0, 0])
+        opts = RunOptions(
+            artifacts_dir=artifacts,
+            force_stage1=False,
+            force_stage2=False,
+            force_stage3=True,
+        )
         run(video, opts, runner=runner)
-        cmd1, cmd2 = runner.calls[0][0], runner.calls[1][0]
+        cmd1, cmd2, cmd3 = runner.calls[0][0], runner.calls[1][0], runner.calls[2][0]
         assert "--force" not in cmd1, "Stage 1 must NOT be forced"
-        assert "--force" in cmd2, "Stage 2 must be forced"
+        assert "--force" not in cmd2, "Stage 2 must NOT be forced"
+        assert "--force" in cmd3, "Stage 3 must be forced"
 
 
 def test_stage1_failure_aborts_before_stage2():
     with tempfile.TemporaryDirectory() as tmp:
         video, artifacts = _make_env(tmp)
-        runner = FakeRunner([1, 0])  # Stage 1 returns non-zero
+        runner = FakeRunner([1, 0, 0])  # Stage 1 returns non-zero
         raised = False
         try:
             run(video, RunOptions(artifacts_dir=artifacts), runner=runner)
@@ -235,6 +268,34 @@ def test_stage1_failure_aborts_before_stage2():
             assert "Stage 1" in str(exc), str(exc)
         assert raised, "non-zero Stage 1 must raise StageError"
         assert len(runner.calls) == 1, "Stage 2 must NOT run after Stage 1 fails"
+
+
+def test_stage2_failure_aborts_before_stage3():
+    with tempfile.TemporaryDirectory() as tmp:
+        video, artifacts = _make_env(tmp)
+        runner = FakeRunner([0, 1, 0])  # Stage 2 returns non-zero
+        raised = False
+        try:
+            run(video, RunOptions(artifacts_dir=artifacts), runner=runner)
+        except StageError as exc:
+            raised = True
+            assert "Stage 2" in str(exc), str(exc)
+        assert raised, "non-zero Stage 2 must raise StageError"
+        assert len(runner.calls) == 2, "Stage 3 must NOT run after Stage 2 fails"
+
+
+def test_stage3_failure_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        video, artifacts = _make_env(tmp)
+        runner = FakeRunner([0, 0, 1])  # Stage 3 returns non-zero
+        raised = False
+        try:
+            run(video, RunOptions(artifacts_dir=artifacts), runner=runner)
+        except StageError as exc:
+            raised = True
+            assert "Stage 3" in str(exc), str(exc)
+        assert raised, "non-zero Stage 3 must raise StageError"
+        assert len(runner.calls) == 3, "all three stages run; Stage 3 failed last"
 
 
 def test_write_summary_called_on_success():
@@ -256,10 +317,14 @@ def test_write_summary_called_on_success():
                 rec = {"stage": "01_track", "wall_time_s": 12.0, "gpu_peak_mb": 100.0,
                        "cpu_rss_start_mb": None, "cpu_rss_end_mb": None, "cpu_peak_mb": None, "io": {}}
                 (paths.profiles_dir / "01_track.json").write_text(json.dumps(rec))
-            else:
+            elif cmd[1].endswith("stage2_refine.py"):
                 rec = {"stage": "02_refine", "wall_time_s": 3.0, "gpu_peak_mb": 250.0,
                        "cpu_rss_start_mb": None, "cpu_rss_end_mb": None, "cpu_peak_mb": None, "io": {}}
                 (paths.profiles_dir / "02_refine.json").write_text(json.dumps(rec))
+            else:
+                rec = {"stage": "03_team", "wall_time_s": 1.0, "gpu_peak_mb": None,
+                       "cpu_rss_start_mb": None, "cpu_rss_end_mb": None, "cpu_peak_mb": None, "io": {}}
+                (paths.profiles_dir / "03_team.json").write_text(json.dumps(rec))
             return CommandResult(0)
 
         result = run(video, RunOptions(artifacts_dir=artifacts), runner=_writing_runner)
@@ -268,10 +333,10 @@ def test_write_summary_called_on_success():
         summary_json = paths.profiles_dir / "summary.json"
         assert summary_json.is_file(), "summary.json must be written"
         data = json.loads(summary_json.read_text())
-        # Aggregation: total wall = 12 + 3 = 15; gpu peak = max(100, 250) = 250.
-        assert abs(data["totals"]["wall_time_s"] - 15.0) < 1e-9, data["totals"]
+        # Aggregation: total wall = 12 + 3 + 1 = 16; gpu peak = max(100, 250) = 250.
+        assert abs(data["totals"]["wall_time_s"] - 16.0) < 1e-9, data["totals"]
         assert data["totals"]["gpu_peak_mb"] == 250.0, data["totals"]
-        assert len(data["profiles"]) == 2, data["profiles"]
+        assert len(data["profiles"]) == 3, data["profiles"]
 
 
 _TESTS = [
@@ -281,11 +346,15 @@ _TESTS = [
     ("stage1 --fp16/--fuse off by default", test_stage1_fp16_and_fuse_off_by_default),
     ("stage1 --fp16/--fuse forwarded", test_stage1_fp16_and_fuse_forwarded),
     ("stage2 refine params forwarded", test_stage2_refine_params_forwarded),
-    ("run: two stages, correct cwd + abs paths to both", test_run_two_stages_cwd_and_abs_paths),
+    ("stage3 command shape", test_stage3_command),
+    ("stage3 force adds --force", test_stage3_force_adds_force),
+    ("run: three stages, correct cwd + abs paths to all", test_run_three_stages_cwd_and_abs_paths),
     ("run: stage 2 gets refine params", test_run_stage2_gets_refine_params),
-    ("force-all forces both stages", test_force_all_forces_both_stages),
-    ("force-stage2 forces only stage 2", test_force_stage2_only),
+    ("force-all forces all stages", test_force_all_forces_all_stages),
+    ("force-stage3 forces only stage 3", test_force_stage3_only),
     ("stage1 failure aborts before stage2", test_stage1_failure_aborts_before_stage2),
+    ("stage2 failure aborts before stage3", test_stage2_failure_aborts_before_stage3),
+    ("stage3 failure raises", test_stage3_failure_raises),
     ("write_summary called + aggregates on success", test_write_summary_called_on_success),
 ]
 

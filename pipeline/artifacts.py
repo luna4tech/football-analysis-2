@@ -10,6 +10,9 @@ artifacts/<video_stem>/
   02_refine/
     refined.txt              refined MOT output
     refined_tracklets.pkl    {id: Tracklet} dict (ids match refined.txt)
+  03_team/
+    refined.txt              refined MOT output with team_id in col 9
+    track_attributes.json    {id: {class, team, gk}} per-track aggregation
   profiles/
     <stage_name>.json   per-stage profiling data
     summary.json        aggregated summary across all stages
@@ -48,6 +51,12 @@ class ArtifactPaths:
         ``root/02_refine/refined.txt``
     refined_tracklets_pkl : Path
         ``root/02_refine/refined_tracklets.pkl``
+    team_dir : Path
+        ``root/03_team/``
+    team_refined_txt : Path
+        ``root/03_team/refined.txt`` (refined MOT output with team_id in col 9)
+    track_attributes_json : Path
+        ``root/03_team/track_attributes.json`` ({id: {class, team, gk}})
     profiles_dir : Path
         ``root/profiles/``
     """
@@ -60,6 +69,9 @@ class ArtifactPaths:
         self.refine_dir: Path = root / "02_refine"
         self.refined_txt: Path = self.refine_dir / "refined.txt"
         self.refined_tracklets_pkl: Path = self.refine_dir / "refined_tracklets.pkl"
+        self.team_dir: Path = root / "03_team"
+        self.team_refined_txt: Path = self.team_dir / "refined.txt"
+        self.track_attributes_json: Path = self.team_dir / "track_attributes.json"
         self.profiles_dir: Path = root / "profiles"
 
     def profile_json(self, stage_name: str) -> Path:
@@ -122,6 +134,7 @@ def ensure_dirs(paths: ArtifactPaths) -> None:
     for directory in (
         paths.track_dir,
         paths.refine_dir,
+        paths.team_dir,
         paths.profiles_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)

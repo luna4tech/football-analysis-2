@@ -1,5 +1,5 @@
 """
-pipeline.orchestrator — chain Stage 1 then Stage 2 as subprocesses.
+pipeline.orchestrator — chain Stage 1, Stage 2, then Stage 3 as subprocesses.
 
 Why subprocesses (not in-process)?
 ----------------------------------
@@ -10,6 +10,7 @@ directory and runs it as its OWN process in its OWN working directory:
 
   * Stage 1 (``tools/stage1_track.py``)   CWD = ``<repo>/Deep-EIoU/Deep-EIoU``
   * Stage 2 (``stage2_refine.py``)        CWD = ``<repo>/gta-link``
+  * Stage 3 (``pipeline/team_assignment.py``) CWD = ``<repo>`` (CWD-independent)
 
 The orchestrator itself runs from the repo root and only touches ``pipeline.*``
 helpers, so this module is import-light (no torch / cv2) and runs on a CPU box.
@@ -33,7 +34,8 @@ Public API
 ----------
 RunOptions               — typed bundle of all run() knobs.
 SubprocessRunner         — default runner (thin wrapper over subprocess.run).
-build_stage1_command(...)/build_stage2_command(...) — pure command builders.
+build_stage1_command(...)/build_stage2_command(...)/build_stage3_command(...)
+                         — pure command builders.
 run(video, opts, runner=None) -> RunResult
 """
 
@@ -52,8 +54,10 @@ from pipeline.profiling import write_summary
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGE1_CWD = _REPO_ROOT / "Deep-EIoU" / "Deep-EIoU"
 STAGE2_CWD = _REPO_ROOT / "gta-link"
+STAGE3_CWD = _REPO_ROOT                    # Stage 3 is CWD-independent
 STAGE1_SCRIPT = "tools/stage1_track.py"   # relative to STAGE1_CWD
 STAGE2_SCRIPT = "stage2_refine.py"        # relative to STAGE2_CWD
+STAGE3_SCRIPT = "pipeline/team_assignment.py"  # relative to STAGE3_CWD
 
 
 # ===========================================================================
@@ -83,8 +87,8 @@ class RunOptions:
 
     Force
     -----
-    force_stage1, force_stage2 : bool
-        Add ``--force`` to the corresponding stage.  ``--force-all`` sets both.
+    force_stage1, force_stage2, force_stage3 : bool
+        Add ``--force`` to the corresponding stage.  ``--force-all`` sets all.
 
     Misc
     ----
@@ -108,6 +112,7 @@ class RunOptions:
         merge_dist_thres: float = 0.4,
         force_stage1: bool = False,
         force_stage2: bool = False,
+        force_stage3: bool = False,
         artifacts_dir: "Optional[str]" = None,
     ) -> None:
         self.device = device
@@ -124,6 +129,7 @@ class RunOptions:
         self.merge_dist_thres = merge_dist_thres
         self.force_stage1 = force_stage1
         self.force_stage2 = force_stage2
+        self.force_stage3 = force_stage3
         self.artifacts_dir = artifacts_dir
 
 
@@ -202,6 +208,24 @@ def build_stage2_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
     return cmd
 
 
+def build_stage3_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -> List[str]:
+    """Build the Stage-3 argv (to run with ``cwd=STAGE3_CWD``).
+
+    Always passes the absolute ``--video`` / ``--artifacts-dir``.  ``--force``
+    only when Stage 3 is forced.  Stage 3 is CWD-independent but is still run
+    with ``cwd=STAGE3_CWD`` (the repo root) for consistency.
+    """
+    cmd: List[str] = [
+        sys.executable,
+        STAGE3_SCRIPT,
+        "--video", video_abs,
+        "--artifacts-dir", artifacts_abs,
+    ]
+    if opts.force_stage3:
+        cmd += ["--force"]
+    return cmd
+
+
 # ===========================================================================
 # Result
 # ===========================================================================
@@ -214,11 +238,13 @@ class RunResult:
         paths: Any,
         stage1_seconds: float,
         stage2_seconds: float,
+        stage3_seconds: float,
         summary_md: Path,
     ) -> None:
         self.paths = paths
         self.stage1_seconds = stage1_seconds
         self.stage2_seconds = stage2_seconds
+        self.stage3_seconds = stage3_seconds
         self.summary_md = summary_md
 
 
@@ -234,7 +260,7 @@ def run(
     opts: RunOptions,
     runner: "Optional[SubprocessRunner]" = None,
 ) -> RunResult:
-    """Run Stage 1 then Stage 2 as subprocesses; aggregate the profile summary.
+    """Run Stage 1, Stage 2, then Stage 3 as subprocesses; aggregate the summary.
 
     Parameters
     ----------
@@ -254,8 +280,10 @@ def run(
     * ``ensure_dirs`` so the artifact tree (incl. ``profiles/``) exists.
     * Runs Stage 1 (cwd=STAGE1_CWD).  If it returns non-zero, ABORTS before
       Stage 2 and raises :class:`StageError` naming Stage 1.
-    * Runs Stage 2 (cwd=STAGE2_CWD).  Non-zero -> :class:`StageError` naming
-      Stage 2.
+    * Runs Stage 2 (cwd=STAGE2_CWD).  Non-zero -> ABORTS before Stage 3 and
+      raises :class:`StageError` naming Stage 2.
+    * Runs Stage 3 (cwd=STAGE3_CWD).  Non-zero -> :class:`StageError` naming
+      Stage 3.
     * On success calls ``write_summary(paths.profiles_dir)`` and prints per-stage
       wall times + the ``summary.md`` path.
 
@@ -298,8 +326,20 @@ def run(
     stage2_seconds = time.perf_counter() - t0
     if res2.returncode != 0:
         raise StageError(
-            f"Stage 2 (refine) failed with exit code {res2.returncode}. "
-            f"Command: {' '.join(stage2_cmd)}"
+            f"Stage 2 (refine) failed with exit code {res2.returncode}; "
+            f"aborting before Stage 3. Command: {' '.join(stage2_cmd)}"
+        )
+
+    # --- Stage 3 ------------------------------------------------------------
+    stage3_cmd = build_stage3_command(video_abs, artifacts_abs, opts)
+    print(f"[pipeline] Stage 3 -> {' '.join(stage3_cmd)}  (cwd={STAGE3_CWD})")
+    t0 = time.perf_counter()
+    res3 = runner(stage3_cmd, STAGE3_CWD)
+    stage3_seconds = time.perf_counter() - t0
+    if res3.returncode != 0:
+        raise StageError(
+            f"Stage 3 (team assignment) failed with exit code {res3.returncode}. "
+            f"Command: {' '.join(stage3_cmd)}"
         )
 
     # --- aggregate the profile summary --------------------------------------
@@ -309,11 +349,13 @@ def run(
     print("[pipeline] done.")
     print(f"[pipeline]   Stage 1 wall: {stage1_seconds:.2f} s")
     print(f"[pipeline]   Stage 2 wall: {stage2_seconds:.2f} s")
+    print(f"[pipeline]   Stage 3 wall: {stage3_seconds:.2f} s")
     print(f"[pipeline]   summary:      {summary_md}")
 
     return RunResult(
         paths=paths,
         stage1_seconds=stage1_seconds,
         stage2_seconds=stage2_seconds,
+        stage3_seconds=stage3_seconds,
         summary_md=summary_md,
     )
