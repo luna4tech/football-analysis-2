@@ -13,14 +13,16 @@ behavior-identical to ``demo.py`` so ``tracks.txt`` is byte-equivalent.
 Run with CWD = ``Deep-EIoU/Deep-EIoU`` (same as demo.py)::
 
     cd Deep-EIoU/Deep-EIoU
-    python tools/stage1_track.py --video /path/to/clip.mp4 -c checkpoints/best_ckpt.pth.tar
+    python tools/stage1_track.py --video /path/to/clip.mp4
+    python tools/stage1_track.py --video /path/to/clip.mp4 --detector yolox \
+        --detector-ckpt checkpoints/best_ckpt.pth.tar
 
 The torch/cv2/yolox-dependent perception + tracking loop only runs on a GPU box
 (verified in Colab).  The pure-Python Tracklet assembly lives in
 ``tools/stage1_assembly.py`` and is unit-tested separately on CPU.
 
 Producer/consumer split (Task 3 will parallelize the *producer* only):
-  * ``perceive(frame, predictor, extractor, width, height) -> (det, embs)``
+  * ``perceive(frame, detector, extractor, width, height) -> (det, embs)``
     is the per-frame producer: detection forward + rescale + edge-removal +
     clamp/crop + ReID embedding.  No cross-frame state.
   * ``track_consume(...)`` is the strict-frame-order tracking consumer: it calls
@@ -103,6 +105,7 @@ from stage1_assembly import (
     load_tracklet_class,
     pipelined_consume_loop,
     split_by_counts,
+    ultralytics_result_to_yolox_output,
 )
 
 from pipeline.artifacts import get_artifact_paths, ensure_dirs
@@ -116,7 +119,7 @@ _GTA_LINK_DIR = osp.join(_REPO_ROOT, "gta-link")
 # ---------------------------------------------------------------------------
 # Shared per-frame post-detection math (the parity guarantee)
 # ---------------------------------------------------------------------------
-def det_and_crops_from_output(output, frame, width, height):
+def det_and_crops_from_output(output, frame, width, height, rescale_boxes=True):
     """Turn ONE frame's raw detector output into ``(det, crops)``.
 
     This is the single source of truth for the per-frame post-detection math —
@@ -150,10 +153,17 @@ def det_and_crops_from_output(output, frame, width, height):
     if output is None:
         return None, None
 
-    # --- rescale boxes + drop edge detections (verbatim from demo.py) ---
-    det = output.cpu().detach().numpy()
-    scale = min(1440 / width, 800 / height)
-    det /= scale
+    # --- optional YOLOX rescale + drop edge detections ---
+    if hasattr(output, "detach"):
+        output = output.detach()
+    if hasattr(output, "cpu"):
+        output = output.cpu()
+    if hasattr(output, "numpy"):
+        output = output.numpy()
+    det = np.asarray(output, dtype=np.float32).copy()
+    if rescale_boxes:
+        scale = min(1440 / width, 800 / height)
+        det /= scale
     rows_to_remove = np.any(det[:, 0:4] < 1, axis=1)  # remove edge detection
     det = det[~rows_to_remove]
 
@@ -172,13 +182,85 @@ def det_and_crops_from_output(output, frame, width, height):
 # ---------------------------------------------------------------------------
 # Producer: pure per-frame perception (no cross-frame state)
 # ---------------------------------------------------------------------------
-def perceive(frame, predictor, extractor, width, height):
+class YoloXDetector:
+    """Adapter around the existing YOLOX Predictor."""
+
+    rescale_boxes = True
+
+    def __init__(self, predictor):
+        self.predictor = predictor
+
+    def infer_one(self, frame):
+        timer = Timer()
+        outputs, _img_info = self.predictor.inference(frame, timer)
+        return outputs[0]
+
+    def infer_batch(self, frames):
+        return infer_batch(self.predictor, frames)
+
+
+class YOLOv11Detector:
+    """Ultralytics YOLO adapter that emits YOLOX-shaped detection rows."""
+
+    rescale_boxes = False
+
+    def __init__(self, ckpt_path, args, device_str):
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise ImportError(
+                "YOLOv11 detector requires the 'ultralytics' package. "
+                "Install it with: pip install ultralytics"
+            ) from exc
+
+        self.model = YOLO(ckpt_path)
+        self.device = 0 if device_str == "gpu" else "cpu"
+        self.half = bool(args.fp16 and device_str == "gpu")
+        self.conf = args.conf
+        self.iou = args.nms
+        self.imgsz = args.tsize
+
+        if args.fuse:
+            fuse = getattr(self.model, "fuse", None)
+            if callable(fuse):
+                logger.info("Fusing YOLOv11 model...")
+                fuse()
+            else:
+                logger.info("--fuse ignored: this Ultralytics model has no fuse() method")
+
+    def _predict(self, source):
+        kwargs = {
+            "source": source,
+            "device": self.device,
+            "half": self.half,
+            "verbose": False,
+        }
+        if self.conf is not None:
+            kwargs["conf"] = self.conf
+        if self.iou is not None:
+            kwargs["iou"] = self.iou
+        if self.imgsz is not None:
+            kwargs["imgsz"] = self.imgsz
+        return self.model.predict(**kwargs)
+
+    def infer_one(self, frame):
+        results = self._predict(frame)
+        if not results:
+            return None
+        return ultralytics_result_to_yolox_output(results[0])
+
+    def infer_batch(self, frames):
+        results = self._predict(frames)
+        return [ultralytics_result_to_yolox_output(result) for result in results]
+
+
+def perceive(frame, detector, extractor, width, height):
     """Detection + rescale + edge-removal + clamp/crop + ReID for one frame.
 
     This is the per-frame *producer* used by the SEQUENTIAL path.  Detection
-    forward runs through ``predictor.inference`` (single image); the
-    post-detection math is the shared ``det_and_crops_from_output`` helper, so
-    it is byte-equivalent to the parallel path's per-frame math.
+    forward runs through the selected detector adapter; the post-detection math
+    is the shared ``det_and_crops_from_output`` helper, so it is byte-equivalent
+    to the parallel path's per-frame math.
 
     Returns
     -------
@@ -188,11 +270,14 @@ def perceive(frame, predictor, extractor, width, height):
         detector produces no output for the frame (mirrors demo.py's
         ``outputs[0] is None`` branch, which emits nothing).
     """
-    timer = Timer()
-    outputs, img_info = predictor.inference(frame, timer)
-    det, crops = det_and_crops_from_output(outputs[0], frame, width, height)
+    output = detector.infer_one(frame)
+    det, crops = det_and_crops_from_output(
+        output, frame, width, height, rescale_boxes=detector.rescale_boxes
+    )
     if det is None:
         return None, None
+    if not crops:
+        return det, np.empty((0, 0), dtype=np.float32)
 
     # --- ReID appearance embedding ---
     embs = extractor(crops)
@@ -315,7 +400,7 @@ def infer_batch(predictor, frames):
 # ---------------------------------------------------------------------------
 # Batched perception producer (detect + shared per-frame math + batched ReID)
 # ---------------------------------------------------------------------------
-def perceive_batch(frames, predictor, extractor, width, height):
+def perceive_batch(frames, detector, extractor, width, height):
     """Batched per-frame producer: ``frames -> list[(det, embs) | (None, None)]``.
 
     Runs ONE batched detector forward, then the SHARED per-frame post-detection
@@ -332,13 +417,15 @@ def perceive_batch(frames, predictor, extractor, width, height):
     list
         One ``(det, embs)`` (or ``(None, None)``) per input frame, in order.
     """
-    outputs = infer_batch(predictor, frames)
+    outputs = detector.infer_batch(frames)
 
     dets = []                       # per-frame det array (or None)
     counts = []                     # per-frame crop count (int) or None passthrough
     all_crops = []                  # flat list of every crop across the batch
     for output, frame in zip(outputs, frames):
-        det, crops = det_and_crops_from_output(output, frame, width, height)
+        det, crops = det_and_crops_from_output(
+            output, frame, width, height, rescale_boxes=detector.rescale_boxes
+        )
         dets.append(det)
         if det is None:
             counts.append(None)
@@ -432,7 +519,7 @@ def _iter_prefetched_frames(path, batch_size):
 # The strict-order loops (`batched_consume_loop`, `pipelined_consume_loop`) live
 # in the pure-Python `stage1_assembly` module so they can be unit-tested on a
 # CPU-only box with stub perceive/consume callables (no torch/cv2/yolox).
-def run_stage1_parallel(predictor, extractor, args, paths):
+def run_stage1_parallel(detector, extractor, args, paths):
     """Parallel perceive -> track -> assemble over the video (opt-in).
 
     Same artifact contract as ``run_stage1``: writes ``tracks.txt`` and
@@ -455,7 +542,7 @@ def run_stage1_parallel(predictor, extractor, args, paths):
     emb_dim_box = [0]  # mutable so the closure can record the embedding width
 
     def _perceive(frames):
-        return perceive_batch(frames, predictor, extractor, width, height)
+        return perceive_batch(frames, detector, extractor, width, height)
 
     def _consume(frame_id, det, embs):
         if frame_id % 30 == 0:
@@ -500,7 +587,7 @@ def run_stage1_parallel(predictor, extractor, args, paths):
 # ---------------------------------------------------------------------------
 # Stage driver
 # ---------------------------------------------------------------------------
-def run_stage1(predictor, extractor, args, paths):
+def run_stage1(detector, extractor, args, paths):
     """Run the sequential perceive -> track -> assemble loop over the video.
 
     Writes ``tracks.txt`` and ``tracklets.pkl`` and returns IO counts used for
@@ -531,7 +618,7 @@ def run_stage1(predictor, extractor, args, paths):
 
         timer.tic()
         # Producer (parallelized in Task 3) — strictly per-frame, no state.
-        det, embs = perceive(frame, predictor, extractor, width, height)
+        det, embs = perceive(frame, detector, extractor, width, height)
         if embs is not None and embs.size:
             emb_dim = embs.shape[1]
         # Consumer — strict frame order; carries the tracker state.
@@ -560,8 +647,12 @@ def run_stage1(predictor, extractor, args, paths):
     }
 
 
-def build_model(exp, args):
-    """Replicate demo.py's model-loading setup (verbatim behavior)."""
+DEFAULT_YOLOV11_CKPT = "checkpoints/yolov11l.pt"
+DEFAULT_YOLOX_CKPT = "checkpoints/best_ckpt.pth.tar"
+
+
+def build_yolox_model(exp, args):
+    """Replicate demo.py's YOLOX model-loading setup (verbatim behavior)."""
     if args.conf is not None:
         exp.test_conf = args.conf
     if args.nms is not None:
@@ -575,7 +666,7 @@ def build_model(exp, args):
 
     if not args.trt:
         if args.ckpt is None:
-            ckpt_file = "checkpoints/best_ckpt.pth.tar"
+            ckpt_file = args.detector_ckpt or DEFAULT_YOLOX_CKPT
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint")
@@ -607,6 +698,25 @@ def build_model(exp, args):
     return model, trt_file, decoder
 
 
+def build_detector(exp, args, device_str):
+    """Build the selected Stage-1 detector adapter."""
+    if args.detector == "yolox":
+        model, trt_file, decoder = build_yolox_model(exp, args)
+        predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16, args.profile)
+        return YoloXDetector(predictor)
+
+    if args.trt:
+        raise ValueError("--trt is only supported with --detector yolox")
+    if args.ckpt is not None:
+        logger.info(
+            "Ignoring legacy -c/--ckpt for --detector yolov11; "
+            "use --detector-ckpt for YOLOv11 checkpoints."
+        )
+    ckpt_file = args.detector_ckpt or DEFAULT_YOLOV11_CKPT
+    logger.info("loading YOLOv11 detector checkpoint from {}".format(ckpt_file))
+    return YOLOv11Detector(ckpt_file, args, device_str)
+
+
 def make_parser():
     """Stage-1 CLI: demo.py's parser + contract args + Task-3 parallel flags.
 
@@ -616,6 +726,19 @@ def make_parser():
     the batched detect+ReID + prefetch-decode path.
     """
     parser = demo_make_parser()
+    parser.add_argument(
+        "--detector",
+        choices=["yolov11", "yolox"],
+        default="yolov11",
+        help="Stage-1 object detector backend. YOLOv11 is the default; YOLOX is the legacy fallback.",
+    )
+    parser.add_argument(
+        "--detector-ckpt",
+        default=None,
+        type=str,
+        help="detector checkpoint path. Defaults to checkpoints/yolov11l.pt for YOLOv11 "
+        "and checkpoints/best_ckpt.pth.tar for YOLOX.",
+    )
     parser.add_argument(
         "--video", required=True, type=str, help="path to the input video (Stage-1 input)"
     )
@@ -679,8 +802,7 @@ def main(exp, args):
             return
         # tracklets.pkl fresh but tracks.txt missing -> fall through and run.
 
-    model, trt_file, decoder = build_model(exp, args)
-    predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16, args.profile)
+    detector = build_detector(exp, args, device_str)
 
     # Derive the ReID device from --device instead of hardcoding 'cuda'.
     extractor = FeatureExtractor(
@@ -698,15 +820,18 @@ def main(exp, args):
         # mode/batch_size let the user guide compare sequential vs parallel runs.
         "mode": mode,
         "batch_size": args.batch_size if args.parallel else None,
+        "detector": args.detector,
+        "detector_ckpt": args.detector_ckpt
+        or (DEFAULT_YOLOX_CKPT if args.detector == "yolox" else DEFAULT_YOLOV11_CKPT),
     }
     with profile_stage("01_track", paths, extra=io_counts):
         if args.parallel:
             logger.info(
                 "Stage 1 parallel mode (batch_size={})".format(args.batch_size)
             )
-            counts = run_stage1_parallel(predictor, extractor, args, paths)
+            counts = run_stage1_parallel(detector, extractor, args, paths)
         else:
-            counts = run_stage1(predictor, extractor, args, paths)
+            counts = run_stage1(detector, extractor, args, paths)
         io_counts.update(counts)
 
     logger.info("Stage 1 done: {}".format(io_counts))

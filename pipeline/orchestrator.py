@@ -107,6 +107,8 @@ class RunOptions:
         self,
         *,
         device: str = "gpu",
+        detector: str = "yolov11",
+        detector_ckpt: "Optional[str]" = None,
         parallel: bool = False,
         batch_size: int = 8,
         fp16: bool = False,
@@ -125,6 +127,14 @@ class RunOptions:
         artifacts_dir: "Optional[str]" = None,
     ) -> None:
         self.device = device
+        self.detector = detector
+        if detector_ckpt is None:
+            detector_ckpt = (
+                "checkpoints/best_ckpt.pth.tar"
+                if detector == "yolox"
+                else "checkpoints/yolov11l.pt"
+            )
+        self.detector_ckpt = detector_ckpt
         self.parallel = parallel
         self.batch_size = batch_size
         self.fp16 = fp16
@@ -184,6 +194,8 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
         "--video", video_abs,
         "--artifacts-dir", artifacts_abs,
         "--device", opts.device,
+        "--detector", opts.detector,
+        "--detector-ckpt", opts.detector_ckpt,
     ]
     if opts.parallel:
         cmd += ["--parallel", "--batch-size", str(opts.batch_size)]

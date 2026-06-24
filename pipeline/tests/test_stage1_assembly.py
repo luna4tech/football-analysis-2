@@ -43,6 +43,7 @@ _asm = _load_assembly()
 TrackletAssembler = _asm.TrackletAssembler
 load_tracklet_class = _asm.load_tracklet_class
 format_mot_line = _asm.format_mot_line
+ultralytics_result_to_yolox_output = _asm.ultralytics_result_to_yolox_output
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +208,50 @@ def test_n_unique_tracks():
     assert asm.n_unique_tracks == 2, asm.n_unique_tracks
 
 
+class _FakeBoxes:
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls = cls
+
+
+class _FakeResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+def test_ultralytics_conversion_rows():
+    result = _FakeResult(
+        _FakeBoxes(
+            np.array([[1, 2, 3, 4], [10, 20, 30, 40]], dtype=np.float32),
+            np.array([0.9, 0.75], dtype=np.float32),
+            np.array([2, 5], dtype=np.float32),
+        )
+    )
+    out = ultralytics_result_to_yolox_output(result)
+    expected = np.array(
+        [
+            [1, 2, 3, 4, 0.9, 1.0, 2],
+            [10, 20, 30, 40, 0.75, 1.0, 5],
+        ],
+        dtype=np.float32,
+    )
+    assert out.dtype == np.float32
+    assert out.shape == (2, 7), out.shape
+    assert np.allclose(out, expected), out
+
+
+def test_ultralytics_conversion_empty():
+    result = _FakeResult(
+        _FakeBoxes(
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    )
+    assert ultralytics_result_to_yolox_output(result) is None
+
+
 _TESTS = [
     ("assembly: module name is 'Tracklet'", test_module_name_is_Tracklet),
     ("assembly: per-track times/scores/bboxes/features aligned", test_per_track_alignment),
@@ -215,6 +260,8 @@ _TESTS = [
     ("assembly: format_mot_line exact", test_format_mot_line_exact),
     ("assembly: pickle round-trips + references module 'Tracklet'", test_pickle_roundtrip_and_module_ref),
     ("assembly: n_unique_tracks", test_n_unique_tracks),
+    ("ultralytics: convert boxes/conf/classes to YOLOX rows", test_ultralytics_conversion_rows),
+    ("ultralytics: empty boxes -> None", test_ultralytics_conversion_empty),
 ]
 
 

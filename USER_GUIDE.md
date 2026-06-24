@@ -58,11 +58,14 @@ inputs (mtime-based). Stage 1 keys on the **video** mtime; Stage 2 keys on
   (`--device cpu` works for Stage 1 but is slow — debugging only.)
 - **Two model checkpoints**, placed where Stage 1 looks for them (paths are
   relative to the Stage 1 CWD `Deep-EIoU/Deep-EIoU/`):
-  - **Detector:** `Deep-EIoU/Deep-EIoU/checkpoints/best_ckpt.pth.tar`
+  - **Detector (default YOLOv11):** `Deep-EIoU/Deep-EIoU/checkpoints/yolov11l.pt`
   - **ReID:** `Deep-EIoU/Deep-EIoU/checkpoints/sports_model.pth.tar-60`
 
   Stage 2 needs **no** checkpoint — it reuses the embeddings already saved in
   `tracklets.pkl`.
+
+  The original YOLOX detector is still available with `--detector yolox`; for
+  that fallback, also place `Deep-EIoU/Deep-EIoU/checkpoints/best_ckpt.pth.tar`.
 
 All commands below assume your shell's CWD is the **repo root**.
 
@@ -74,15 +77,23 @@ All commands below assume your shell's CWD is the **repo root**.
 python -m pipeline run --video clip.mp4
 ```
 
-This runs Stage 1 then Stage 2 with the **full** refinement (both `--use_split`
-and `--use_connect` on by default), streaming each stage's live progress, and
-finally writes `profiles/summary.md`.
+This runs Stage 1 with the default YOLOv11 detector checkpoint
+`checkpoints/yolov11l.pt`, then Stage 2 with the **full** refinement (both
+`--use_split` and `--use_connect` on by default), streaming each stage's live
+progress, and finally writes `profiles/summary.md`.
 
 Common options:
 
 ```bash
 # Choose where artifacts land (default: <repo>/artifacts)
 python -m pipeline run --video clip.mp4 --artifacts-dir /content/artifacts
+
+# Use a custom YOLOv11 checkpoint path
+python -m pipeline run --video clip.mp4 --detector-ckpt /abs/path/yolov11l.pt
+
+# Fall back to the original YOLOX detector
+python -m pipeline run --video clip.mp4 --detector yolox \
+    --detector-ckpt checkpoints/best_ckpt.pth.tar
 
 # Stage-1 throughput: --fp16 is the main lever (~1.5-2x on GPU). See §8.
 python -m pipeline run --video clip.mp4 --fp16 --fuse
@@ -117,6 +128,10 @@ python tools/stage1_track.py \
     --video /abs/path/clip.mp4 \
     --artifacts-dir /abs/path/artifacts \
     --device gpu --fp16          # --fp16 = main throughput lever (see §8)
+# YOLOX fallback:
+python tools/stage1_track.py --video /abs/path/clip.mp4 \
+    --artifacts-dir /abs/path/artifacts --detector yolox \
+    --detector-ckpt checkpoints/best_ckpt.pth.tar
 # parallel variant (decode/compute overlap on top of --fp16):
 python tools/stage1_track.py --video /abs/path/clip.mp4 \
     --artifacts-dir /abs/path/artifacts --fp16 --parallel --batch-size 16
@@ -260,9 +275,8 @@ GPU peak). Use the `io` block to compare a sequential vs a parallel run (same
 
 ### 8a. `--fp16` is the main throughput lever
 
-The Stage-1 detector (YOLOX-x, ~99M params / ~793 GFLOPs **per frame**) is the
-bottleneck, and at this input size it **saturates the GPU at batch size 1**.
-Half-precision inference is the single biggest win:
+Stage 1 detector inference is usually the bottleneck. Half-precision inference
+is the first throughput lever to try:
 
 ```bash
 python -m pipeline run --video clip.mp4 --device gpu --fp16

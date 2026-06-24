@@ -77,6 +77,20 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         help="device for Stage 1 detection + ReID",
     )
     g1.add_argument(
+        "--detector",
+        default="yolov11",
+        choices=["yolov11", "yolox"],
+        help="Stage 1 detector backend; YOLOv11 uses an Ultralytics checkpoint, "
+        "YOLOX uses the original DeepEIoU detector",
+    )
+    g1.add_argument(
+        "--detector-ckpt",
+        dest="detector_ckpt",
+        default=None,
+        help="Stage 1 detector checkpoint. Defaults to checkpoints/yolov11l.pt "
+        "for YOLOv11 and checkpoints/best_ckpt.pth.tar for YOLOX.",
+    )
+    g1.add_argument(
         "--parallel",
         action="store_true",
         default=False,
@@ -134,7 +148,7 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         "--fast-merge",
         dest="fast_merge",
         action="store_true",
-        default=False,
+        default=True,
         help="exact batched connect/merge (same output, orders of magnitude "
         "faster than the per-pair GPU path); only affects --use_connect",
     )
@@ -173,8 +187,18 @@ def _run_from_args(args: argparse.Namespace) -> int:
         )
         return 2
 
+    detector_ckpt = args.detector_ckpt
+    if detector_ckpt is None:
+        detector_ckpt = (
+            "checkpoints/best_ckpt.pth.tar"
+            if args.detector == "yolox"
+            else "checkpoints/yolov11l.pt"
+        )
+
     opts = RunOptions(
         device=args.device,
+        detector=args.detector,
+        detector_ckpt=detector_ckpt,
         parallel=args.parallel,
         batch_size=args.batch_size,
         fp16=args.fp16,

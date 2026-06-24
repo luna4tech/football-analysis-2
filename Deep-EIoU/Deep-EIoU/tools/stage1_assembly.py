@@ -32,6 +32,54 @@ from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 
 
+def _array_like_to_numpy(value: Any) -> "np.ndarray":
+    """Convert torch/numpy-like values to a NumPy array without importing torch."""
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def ultralytics_result_to_yolox_output(result: Any) -> "np.ndarray | None":
+    """Convert one Ultralytics detection result to DeepEIoU's YOLOX row shape.
+
+    Output rows are ``[x1, y1, x2, y2, score, class_conf, class_id]``.  The
+    tracker multiplies ``score * class_conf`` for 7-column rows, so
+    ``class_conf`` is fixed at 1.0 to preserve Ultralytics' confidence as the
+    effective tracking score.
+    """
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return None
+
+    xyxy = _array_like_to_numpy(getattr(boxes, "xyxy", None))
+    if xyxy.size == 0:
+        return None
+    xyxy = xyxy.reshape(-1, 4).astype(np.float32, copy=False)
+
+    conf = _array_like_to_numpy(getattr(boxes, "conf", None)).reshape(-1, 1)
+    cls = _array_like_to_numpy(getattr(boxes, "cls", None)).reshape(-1, 1)
+    if conf.shape[0] != xyxy.shape[0] or cls.shape[0] != xyxy.shape[0]:
+        raise ValueError(
+            "Ultralytics result has mismatched boxes/conf/classes: "
+            f"{xyxy.shape[0]} boxes, {conf.shape[0]} confidences, {cls.shape[0]} classes"
+        )
+
+    class_conf = np.ones_like(conf, dtype=np.float32)
+    return np.concatenate(
+        [
+            xyxy,
+            conf.astype(np.float32, copy=False),
+            class_conf,
+            cls.astype(np.float32, copy=False),
+        ],
+        axis=1,
+    )
+
+
 # MOT result line format.  This is byte-for-byte the string demo.py appends to
 # its ``results`` list:
 #   f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
