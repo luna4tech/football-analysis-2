@@ -50,7 +50,12 @@ def get_color(idx):
 
 
 def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None,
-                  line_thickness=None, text_scale=None, text_thickness=None):
+                  line_thickness=None, text_scale=None, text_thickness=None,
+                  colors=None, id_texts=None):
+    # `colors` (per-box BGR tuples) and `id_texts` (per-box label strings) are
+    # optional overrides used by render_from_txt to color/label by category. When
+    # either is None we fall back to the original look (get_color(id) + bare id),
+    # so existing callers (e.g. demo.py) are unaffected.
     im = np.ascontiguousarray(np.copy(image))
     im_h, im_w = im.shape[:2]
 
@@ -75,10 +80,13 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=N
         x1, y1, w, h = tlwh
         intbox = tuple(map(int, (x1, y1, x1 + w, y1 + h)))
         obj_id = int(obj_ids[i])
-        id_text = '{}'.format(int(obj_id))
-        if ids2 is not None:
-            id_text = id_text + ', {}'.format(int(ids2[i]))
-        color = get_color(abs(obj_id))
+        if id_texts is not None:
+            id_text = '{}'.format(id_texts[i])
+        else:
+            id_text = '{}'.format(int(obj_id))
+            if ids2 is not None:
+                id_text = id_text + ', {}'.format(int(ids2[i]))
+        color = colors[i] if colors is not None else get_color(abs(obj_id))
         cv2.rectangle(im, intbox[0:2], intbox[2:4], color=color, thickness=line_thickness)
         cv2.putText(im, id_text, (intbox[0], intbox[1]), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
                     thickness=text_thickness)
