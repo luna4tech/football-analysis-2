@@ -38,6 +38,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from eval.attributes import run_attribute_eval
 from eval.gt_adapters import GT_LOADERS, load_gt, load_pred
 from eval.trackeval_runner import (
     extract_all_metrics,
@@ -245,12 +246,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_pred_path(args: argparse.Namespace) -> Path:
-    """Return the refined.txt path from --pred or auto-located from --video."""
+    """Return the prediction path from --pred or auto-located from --video.
+
+    An explicit ``--pred`` is always honored. For ``--video`` auto-location,
+    prefer the Stage-3 ``03_team/refined.txt`` (which carries semantic class/team)
+    when it exists, falling back to ``02_refine/refined.txt``. Boxes/ids are
+    identical between the two, so HOTA is unaffected; this just makes class/team
+    available to the attribute eval.
+    """
     if args.pred:
         return Path(args.pred)
     from pipeline.artifacts import get_artifact_paths
 
     paths = get_artifact_paths(args.video, base_dir=args.artifacts_dir)
+    if paths.team_refined_txt.is_file():
+        return paths.team_refined_txt
     return paths.refined_txt
 
 
@@ -381,6 +391,21 @@ def run_evaluation(
         f"(headline + all {sum(len(v) for v in full_metrics.values())} metrics "
         f"across {len(full_metrics)} families)"
     )
+
+    # ---- Attribute (class/team/consistency) eval — NON-FATAL ----
+    # Computed off the RAW txt (semantic class@8 / team@9), fully independent of
+    # the all-person TrackEval path above. A failure here must NOT break the HOTA
+    # path: we log and continue so metrics.json (already written) still stands.
+    attr_out = out_path.parent / "attributes_metrics.json"
+    try:
+        run_attribute_eval(gt_path, pred_path, attr_out)
+        print(f"[eval] attributes_metrics.json written to: {attr_out}")
+    except Exception as exc:  # noqa: BLE001 — attribute eval must never break HOTA
+        print(
+            f"[eval] WARNING: attribute eval failed ({type(exc).__name__}: {exc}); "
+            "HOTA/MOTA results above are unaffected.",
+            file=sys.stderr,
+        )
 
     return metrics
 

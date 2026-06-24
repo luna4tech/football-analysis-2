@@ -93,23 +93,28 @@ def _format_gt_line(row: "np.ndarray | list") -> str:
     """Format one canonical GT row to a MOTChallenge ``gt.txt`` CSV line.
 
     Output columns (the order TrackEval's MotChallenge2DBox reads):
-    ``frame,id,x,y,w,h,conf,class,visibility``. ``class`` is taken from canonical
-    column index 7 and ``visibility`` from index 8 — NOT hardcoded to ``-1``.
-    The GT loader already coerces the data's ``-1`` to ``1`` for these columns,
-    so a sample GT row lands here as ``class=1, visibility=1``; writing the real
-    values is what lets TrackEval's pedestrian eval (class id 1) keep the GT.
+    ``frame,id,x,y,w,h,conf,class,visibility``. ``class`` and ``visibility`` are
+    written as the CONSTANT pedestrian values ``1`` and ``1`` — NOT taken from the
+    canonical row — so that the materialized ``gt.txt`` stays all-person regardless
+    of the semantic ``class_id`` (0/1/2) the extended GT now carries in canonical
+    column 7. TrackEval's MOTChallenge pedestrian eval keeps ONLY ``class==1``
+    rows; writing the semantic class verbatim would drop every player (0) and
+    referee (2) row and silently break HOTA/MOTA. The semantic class/team are
+    evaluated separately by :mod:`eval.attributes` straight off the raw txt.
 
-    ``frame`` and ``id`` are written as integers; the box, ``conf``, and
-    ``visibility`` keep their (float) precision. ``class`` is written as an
-    integer (TrackEval matches class ids).
+    For the current all-``-1`` sample GT this is identical to the previous
+    behaviour (the loader coerced ``-1`` -> ``1``, so it already landed here as
+    ``class=1, visibility=1``); for an extended GT it is the fix that keeps HOTA
+    all-person.
+
+    ``frame`` and ``id`` are written as integers; the box and ``conf`` keep their
+    (float) precision. ``class`` and ``visibility`` are the constant ``1``.
     """
     frame = int(round(float(row[0])))
     tid = int(round(float(row[1])))
     x, y, w, h = (float(v) for v in row[2:6])
     conf = float(row[6])
-    cls = int(round(float(row[7])))
-    vis = float(row[8])
-    return f"{frame},{tid},{x:g},{y:g},{w:g},{h:g},{conf:g},{cls},{vis:g}"
+    return f"{frame},{tid},{x:g},{y:g},{w:g},{h:g},{conf:g},1,1"
 
 
 def _format_pred_line(row: "np.ndarray | list") -> str:
@@ -206,7 +211,7 @@ def materialize_layout(
     paths.seqmaps_dir.mkdir(parents=True, exist_ok=True)
     paths.tracker_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- GT gt.txt (AS-IS, 1-based; real class@7 + visibility@8) ---
+    # --- GT gt.txt (AS-IS, 1-based; class=1/vis=1 forced -> all-person) ---
     gt_rows = _gt_to_motchallenge_rows(gt)
     _write_mot_file(paths.gt_txt, gt_rows, _format_gt_line)
 
@@ -235,8 +240,8 @@ def _write_mot_file(path: Path, rows: np.ndarray, formatter) -> None:
     """Write *rows* as MOTChallenge CSV lines (one per row) to *path*.
 
     *formatter* is the per-row line formatter — :func:`_format_gt_line` for the
-    GT ``gt.txt`` (real class/visibility) or :func:`_format_pred_line` for the
-    tracker file (inert ``-1,-1,-1`` trailing columns).
+    GT ``gt.txt`` (constant class=1/visibility=1) or :func:`_format_pred_line` for
+    the tracker file (inert ``-1,-1,-1`` trailing columns).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [formatter(r) for r in rows]

@@ -62,6 +62,17 @@ from eval.evaluate import (
     run_evaluation,
     write_metrics_json,
 )
+from eval.attributes import (
+    aggregate_gt_tracks,
+    aggregate_pred_tracks,
+    associate_tracks,
+    class_metrics,
+    compute_attribute_metrics,
+    consistency_metrics,
+    parse_attr_rows,
+    run_attribute_eval,
+    team_metrics,
+)
 
 # ---------------------------------------------------------------------------
 # Tiny test harness (mirrors pipeline/tests style)
@@ -849,6 +860,396 @@ def test_run_evaluation_stub_no_trackeval_imported():
 
 
 # ---------------------------------------------------------------------------
+# 10. Task 005 — _format_gt_line forces class=1/vis=1 for an EXTENDED GT
+# ---------------------------------------------------------------------------
+
+
+def test_format_gt_line_forces_class1_vis1_for_extended_gt():
+    """A canonical GT row carrying semantic class 0 or 2 must still be written
+    with class=1 and visibility=1, so TrackEval's pedestrian (class==1) eval keeps
+    every row and HOTA/MOTA stay all-person."""
+    from eval.trackeval_runner import _format_gt_line
+
+    # canonical row: frame,id,x,y,w,h,conf,class,visibility
+    player = _format_gt_line([5, 7, 10, 20, 30, 40, 1.0, 0, 0.5])  # class 0
+    referee = _format_gt_line([6, 8, 11, 21, 31, 41, 1.0, 2, 0.9])  # class 2
+    gk = _format_gt_line([7, 9, 12, 22, 32, 42, 1.0, 1, 1.0])  # class 1
+
+    for line, lbl in ((player, "player"), (referee, "referee"), (gk, "gk")):
+        cols = line.split(",")
+        assert len(cols) == 9, f"{lbl}: gt line must have 9 cols: {line}"
+        assert cols[7] == "1", f"{lbl}: class must be forced to 1, got {cols[7]!r}"
+        assert cols[8] == "1", f"{lbl}: visibility must be forced to 1, got {cols[8]!r}"
+
+    # Sanity: frame/id/box/conf for the player row are preserved.
+    pc = player.split(",")
+    assert pc[0] == "5" and pc[1] == "7"
+    assert pc[2:6] == ["10", "20", "30", "40"]
+    assert abs(float(pc[6]) - 1.0) < 1e-9
+
+
+def test_extended_gt_materializes_all_class1():
+    """End-to-end: an extended GT (class 0/1/2 via a custom loader) materializes a
+    gt.txt whose EVERY row is class=1/vis=1 (no rows dropped by TrackEval)."""
+    extended = np.array(
+        [
+            [1, 1, 0, 0, 10, 10, 1, 0, 1],  # player
+            [1, 2, 20, 20, 10, 10, 1, 2, 1],  # referee
+            [2, 3, 40, 40, 10, 10, 1, 1, 1],  # goalkeeper
+        ],
+        dtype=np.float64,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = Tracks(rows=extended.copy(), frame_base=1)
+        pred = load_pred(_write(Path(tmp) / "refined.txt", _SAMPLE_PRED))
+        layout = materialize_layout(Path(tmp) / "work", "X", gt, pred)
+        for cols in _read_mot_rows(layout.gt_txt):
+            assert cols[7] == "1" and cols[8] == "1", cols
+
+
+# ---------------------------------------------------------------------------
+# 11. Task 005 — attribute raw parser (NO -1 coercion)
+# ---------------------------------------------------------------------------
+
+# Extended pred: frame,id,x,y,w,h,score,class,team,-1 (0-based frames).
+_ATTR_PRED = (
+    "0,1,100,100,50,50,0.9,0,0,-1\n"
+    "1,1,101,101,50,50,0.9,0,0,-1\n"
+    "0,2,300,300,40,40,0.8,2,-1,-1\n"
+    "0,3,500,100,45,55,0.7,1,-1,-1\n"  # goalkeeper, no team
+)
+
+# Extended GT: frame,id,x,y,w,h,conf,class,team (1-based frames).
+_ATTR_GT = (
+    "1,10,102,102,50,50,1,0,1\n"
+    "2,10,102,102,50,50,1,0,1\n"
+    "1,20,301,301,40,40,1,2,-1\n"
+    "1,30,502,102,45,55,1,1,-1\n"  # goalkeeper
+)
+
+
+def test_parse_attr_rows_no_minus1_coercion():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(Path(tmp) / "pred.txt", _ATTR_PRED)
+        rows = parse_attr_rows(p)
+        assert rows.shape == (4, 8), rows.shape
+        # class col (idx 6): 0,0,2,1 ; team col (idx 7): 0,0,-1,-1 (kept verbatim).
+        assert rows[:, 6].tolist() == [0.0, 0.0, 2.0, 1.0]
+        assert rows[:, 7].tolist() == [0.0, 0.0, -1.0, -1.0], "team -1 must NOT coerce"
+
+
+def test_parse_attr_rows_missing_blank_become_minus1():
+    with tempfile.TemporaryDirectory() as tmp:
+        # row 1 omits class/team entirely; row 2 has blank class.
+        content = "0,1,1,2,3,4,0.5\n1,2,1,2,3,4,0.5,,0\n"
+        p = _write(Path(tmp) / "pred.txt", content)
+        rows = parse_attr_rows(p)
+        assert rows.shape == (2, 8)
+        assert rows[0, 6] == -1.0 and rows[0, 7] == -1.0, "absent -> -1"
+        assert rows[1, 6] == -1.0, "blank class -> -1"
+        assert rows[1, 7] == 0.0, "explicit 0 team kept"
+
+
+# ---------------------------------------------------------------------------
+# 12. Task 005 — IoU matching + majority association
+# ---------------------------------------------------------------------------
+
+
+def test_associate_tracks_iou_majority_with_frame_shift():
+    pred = parse_attr_rows_str(_ATTR_PRED)
+    gt = parse_attr_rows_str(_ATTR_GT)
+    assoc = associate_tracks(pred, gt)  # pred 0-based, gt 1-based -> +1 shift
+    # pred 1 (player) overlaps gt 10 across frames; pred 2 -> gt 20; pred 3 -> gt 30.
+    assert assoc == {1: 10, 2: 20, 3: 30}, assoc
+
+
+def test_associate_tracks_no_match_when_below_threshold():
+    pred = np.array([[0, 1, 0, 0, 10, 10, 0, 0]], dtype=np.float64)
+    gt = np.array([[1, 10, 900, 900, 10, 10, 0, 1]], dtype=np.float64)
+    assert associate_tracks(pred, gt) == {}, "non-overlapping boxes must not match"
+
+
+def test_associate_tracks_majority_breaks_split():
+    """A pred track overlapping two GT ids picks the one it co-occurs with most."""
+    pred = np.array(
+        [
+            [0, 1, 100, 100, 50, 50, 0, 0],
+            [1, 1, 100, 100, 50, 50, 0, 0],
+            [2, 1, 100, 100, 50, 50, 0, 0],
+        ],
+        dtype=np.float64,
+    )
+    gt = np.array(
+        [
+            [1, 10, 100, 100, 50, 50, 0, 0],  # frame 1 (pred 0+1)
+            [2, 10, 100, 100, 50, 50, 0, 0],  # frame 2 (pred 1+1) -> 10 twice
+            [3, 20, 100, 100, 50, 50, 0, 0],  # frame 3 (pred 2+1) -> 20 once
+        ],
+        dtype=np.float64,
+    )
+    assert associate_tracks(pred, gt) == {1: 10}, "majority GT id wins"
+
+
+# ---------------------------------------------------------------------------
+# 13. Task 005 — class accuracy + confusion matrix
+# ---------------------------------------------------------------------------
+
+
+def test_class_metrics_accuracy_and_confusion():
+    assoc = {1: 10, 2: 20, 3: 30}
+    pred_cls = {1: 0, 2: 0, 3: 1}  # pred 2 wrong (referee gt -> labelled player)
+    gt_cls = {10: 0, 20: 2, 30: 1}
+    m = class_metrics(assoc, pred_cls, gt_cls)
+    assert m["n_evaluated"] == 3
+    assert m["n_correct"] == 2, m
+    assert abs(m["accuracy"] - 2 / 3) < 1e-9, m
+    # confusion[gt][pred]; gt referee(2) predicted player(0) -> [2][0] == 1.
+    conf = m["confusion"]
+    assert conf[0][0] == 1, "player->player"
+    assert conf[2][0] == 1, "referee misclassified as player"
+    assert conf[1][1] == 1, "gk->gk"
+
+
+def test_class_metrics_skips_unknown_gt_class():
+    assoc = {1: 10, 2: 20}
+    pred_cls = {1: 0, 2: 0}
+    gt_cls = {10: 0, 20: -1}  # gt 20 unknown -> not scored
+    m = class_metrics(assoc, pred_cls, gt_cls)
+    assert m["n_evaluated"] == 1, m
+    assert m["accuracy"] == 1.0, m
+
+
+# ---------------------------------------------------------------------------
+# 14. Task 005 — players-only permutation-invariant team accuracy
+# ---------------------------------------------------------------------------
+
+
+def test_team_metrics_permutation_invariant_players_only():
+    assoc = {1: 10, 2: 20, 3: 30, 4: 40}
+    pred_cls = {1: 0, 2: 0, 3: 0, 4: 2}  # 4 is a referee -> excluded
+    gt_cls = {10: 0, 20: 0, 30: 0, 40: 2}
+    # pred teams are the SWAP of gt teams -> perm-invariant accuracy must be 1.0.
+    pred_team = {1: 1, 2: 1, 3: 0, 4: -1}
+    gt_team = {10: 0, 20: 0, 30: 1, 40: -1}
+    m = team_metrics(assoc, pred_cls, pred_team, gt_cls, gt_team)
+    assert m["n_players"] == 3, m
+    assert abs(m["accuracy"] - 1.0) < 1e-9, "swapped labels -> still perfect"
+
+
+def test_team_metrics_excludes_gk_and_referee():
+    assoc = {1: 10, 2: 20}
+    pred_cls = {1: 1, 2: 2}  # gk + referee, NO players
+    gt_cls = {10: 1, 20: 2}
+    pred_team = {1: 0, 2: 1}
+    gt_team = {10: 0, 20: 1}
+    m = team_metrics(assoc, pred_cls, pred_team, gt_cls, gt_team)
+    assert m["n_players"] == 0, m
+    assert m["accuracy"] is None and "reason" in m, m
+
+
+# ---------------------------------------------------------------------------
+# 15. Task 005 — consistency (purity / switches)
+# ---------------------------------------------------------------------------
+
+
+def test_consistency_purity_and_switches():
+    # track 1: classes [0,0,0] pure; track 2: [0,2,0] -> majority 0, 2 switches.
+    rows = np.array(
+        [
+            [0, 1, 0, 0, 1, 1, 0, -1],
+            [1, 1, 0, 0, 1, 1, 0, -1],
+            [2, 1, 0, 0, 1, 1, 0, -1],
+            [0, 2, 0, 0, 1, 1, 0, -1],
+            [1, 2, 0, 0, 1, 1, 2, -1],
+            [2, 2, 0, 0, 1, 1, 0, -1],
+        ],
+        dtype=np.float64,
+    )
+    m = consistency_metrics(rows)
+    assert m["n_tracks"] == 2
+    t1 = m["per_track"]["1"]
+    t2 = m["per_track"]["2"]
+    assert t1["purity"] == 1.0 and t1["switches"] == 0
+    assert abs(t2["purity"] - 2 / 3) < 1e-9, t2
+    assert t2["switches"] == 2, t2
+    assert m["total_class_switches"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 16. Task 005 — graceful degradation branches
+# ---------------------------------------------------------------------------
+
+
+def test_compute_metrics_gt_all_minus1_skips_class_and_team():
+    pred = parse_attr_rows_str(_ATTR_PRED)
+    # GT all class -1, team -1 (the current sample-GT case).
+    gt = np.array(
+        [
+            [1, 10, 102, 102, 50, 50, -1, -1],
+            [2, 10, 102, 102, 50, 50, -1, -1],
+        ],
+        dtype=np.float64,
+    )
+    m = compute_attribute_metrics(gt, pred)
+    assert m["class"].get("skipped") is True, m["class"]
+    assert "all -1" in m["class"]["reason"]
+    assert m["team"].get("skipped") is True, m["team"]
+    # Consistency + counts always emitted.
+    assert "consistency" in m and m["consistency"]["n_tracks"] >= 1
+    assert "counts" in m and "matched_tracks" in m["counts"]
+
+
+def test_compute_metrics_no_iou_match_skips_but_keeps_consistency():
+    pred = np.array([[0, 1, 0, 0, 10, 10, 0, 0]], dtype=np.float64)
+    gt = np.array([[1, 10, 900, 900, 10, 10, 0, 1]], dtype=np.float64)
+    m = compute_attribute_metrics(gt, pred)
+    assert m["counts"]["matched_tracks"] == 0
+    assert m["class"].get("skipped") is True
+    assert m["team"].get("skipped") is True
+    assert m["consistency"]["n_tracks"] == 1, "consistency still emitted"
+
+
+def test_compute_metrics_pred_no_team_skips_team_only():
+    pred = np.array(
+        [[0, 1, 100, 100, 50, 50, 0, -1], [1, 1, 100, 100, 50, 50, 0, -1]],
+        dtype=np.float64,
+    )  # pred has class 0 but NO team
+    gt = np.array(
+        [[1, 10, 100, 100, 50, 50, 0, 1], [2, 10, 100, 100, 50, 50, 0, 1]],
+        dtype=np.float64,
+    )
+    m = compute_attribute_metrics(gt, pred)
+    # GT has semantic class -> class metrics computed; pred lacks team -> team skipped.
+    assert m["class"].get("skipped") is not True, m["class"]
+    assert m["team"].get("skipped") is True and "pred" in m["team"]["reason"], m["team"]
+
+
+def test_ari_nmi_skipped_when_sklearn_absent():
+    """When sklearn cannot import, team metrics still emit accuracy with ARI/NMI None."""
+    import sys as _sys
+
+    _SENTINEL = "__absent__"
+    # Block BOTH the package and the submodule: an earlier test may have cached
+    # sklearn.metrics, in which case `from sklearn.metrics import ...` would still
+    # resolve. Setting them to None forces an ImportError on the lazy import.
+    blocked = ("sklearn", "sklearn.metrics")
+    saved = {name: _sys.modules.get(name, _SENTINEL) for name in blocked}
+    for name in blocked:
+        _sys.modules[name] = None  # type: ignore[assignment]
+    try:
+        assoc = {1: 10, 2: 20}
+        pred_cls = {1: 0, 2: 0}
+        gt_cls = {10: 0, 20: 0}
+        pred_team = {1: 0, 2: 1}
+        gt_team = {10: 0, 20: 1}
+        m = team_metrics(assoc, pred_cls, pred_team, gt_cls, gt_team)
+        assert m["accuracy"] is not None, "accuracy is pure; must still be present"
+        assert m["ari"] is None and m["nmi"] is None, m
+        assert "clustering_reason" in m, m
+    finally:
+        for name in blocked:
+            if saved[name] == _SENTINEL:
+                _sys.modules.pop(name, None)
+            else:
+                _sys.modules[name] = saved[name]
+
+
+# ---------------------------------------------------------------------------
+# 17. Task 005 — track_attributes.json preferred for pred per-track class/team
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_pred_prefers_track_attributes_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        # txt says track 1 class 0/team 0; json (authoritative) says class 1/team 1.
+        pred_txt = "0,1,0,0,10,10,0.9,0,0,-1\n1,1,0,0,10,10,0.9,0,0,-1\n"
+        rows = parse_attr_rows_str(pred_txt)
+        attr_json = _write(
+            Path(tmp) / "track_attributes.json",
+            '{"1": {"class": 1, "team": 1, "gk": true}}',
+        )
+        cls, team = aggregate_pred_tracks(rows, attr_json)
+        assert cls[1] == 1, "json class must win over txt majority"
+        assert team[1] == 1, "json team must win over txt constant"
+
+
+def test_aggregate_pred_falls_back_to_txt_without_json():
+    pred_txt = "0,1,0,0,10,10,0.9,2,-1,-1\n1,1,0,0,10,10,0.9,2,-1,-1\n"
+    rows = parse_attr_rows_str(pred_txt)
+    cls, team = aggregate_pred_tracks(rows, None)
+    assert cls[1] == 2 and team[1] == -1, "txt-derived values used"
+
+
+# ---------------------------------------------------------------------------
+# 18. Task 005 — run_attribute_eval writes JSON; auto-locates attributes.json
+# ---------------------------------------------------------------------------
+
+
+def test_run_attribute_eval_writes_json_and_uses_sibling_attrs():
+    with tempfile.TemporaryDirectory() as tmp:
+        team_dir = Path(tmp) / "03_team"
+        pred = _write(team_dir / "refined.txt", _ATTR_PRED)
+        _write(
+            team_dir / "track_attributes.json",
+            '{"1": {"class": 0, "team": 0, "gk": false},'
+            ' "2": {"class": 2, "team": -1, "gk": false},'
+            ' "3": {"class": 1, "team": -1, "gk": true}}',
+        )
+        gt = _write(Path(tmp) / "gt.txt", _ATTR_GT)
+        out = Path(tmp) / "attributes_metrics.json"
+        m = run_attribute_eval(gt, pred, out)
+        assert out.is_file(), "attributes_metrics.json must be written"
+        import json as _json
+
+        data = _json.loads(out.read_text(encoding="utf-8"))
+        assert data["counts"]["matched_tracks"] == 3, data["counts"]
+        assert data["class"]["accuracy"] == 1.0, data["class"]
+        # sibling json was auto-located.
+        assert "track_attributes_json" in data
+        assert m["consistency"]["n_tracks"] == 3
+
+
+def test_run_evaluation_attribute_eval_nonfatal(_capsys=None):
+    """A broken attribute eval must NOT break the HOTA path (metrics.json still
+    written, run_evaluation returns the 5 metrics)."""
+
+    def _stub_runner(layout, **kwargs):
+        return _fake_result(tracker=layout.tracker_name)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        gt_file = _write(Path(tmp) / "gt.txt", _SAMPLE_GT)
+        pred_file = _write(Path(tmp) / "refined.txt", _SAMPLE_PRED)
+        work_dir = Path(tmp) / "work"
+        out_path = Path(tmp) / "metrics.json"
+
+        # Monkeypatch run_attribute_eval (imported into eval.evaluate) to raise.
+        import eval.evaluate as _ev
+
+        original = _ev.run_attribute_eval
+
+        def _boom(*a, **k):
+            raise RuntimeError("intentional attribute-eval failure")
+
+        _ev.run_attribute_eval = _boom
+        try:
+            metrics = run_evaluation(
+                pred_file, gt_file, "M59", work_dir, out_path, _runner=_stub_runner
+            )
+        finally:
+            _ev.run_attribute_eval = original
+
+        assert set(metrics) == {"HOTA", "DetA", "AssA", "MOTA", "IDF1"}, metrics
+        assert out_path.is_file(), "metrics.json must still be written"
+
+
+# Helper: parse an attribute MOT string fixture without a temp file.
+def parse_attr_rows_str(content: str) -> np.ndarray:
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(Path(tmp) / "_attr.txt", content)
+        return parse_attr_rows(p)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -895,6 +1296,35 @@ _TESTS = [
     ("metrics.json: omits all_metrics when absent", test_write_metrics_json_omits_all_metrics_when_absent),
     ("E2 run_evaluation: stub runner writes metrics.json", test_run_evaluation_injected_stub_writes_metrics_json),
     ("E2 run_evaluation: stub does not import trackeval", test_run_evaluation_stub_no_trackeval_imported),
+    # Task 005 — _format_gt_line forces class=1/vis=1
+    ("005 gt-line: class=1/vis=1 for extended class 0/1/2", test_format_gt_line_forces_class1_vis1_for_extended_gt),
+    ("005 gt-line: extended GT materializes all class=1", test_extended_gt_materializes_all_class1),
+    # Task 005 — attribute raw parser (no -1 coercion)
+    ("005 parse: raw attr keeps -1 (no coercion)", test_parse_attr_rows_no_minus1_coercion),
+    ("005 parse: missing/blank class/team -> -1", test_parse_attr_rows_missing_blank_become_minus1),
+    # Task 005 — IoU matching + majority association
+    ("005 assoc: IoU match + majority (frame +1 shift)", test_associate_tracks_iou_majority_with_frame_shift),
+    ("005 assoc: below-threshold -> no match", test_associate_tracks_no_match_when_below_threshold),
+    ("005 assoc: majority breaks a split", test_associate_tracks_majority_breaks_split),
+    # Task 005 — class metrics
+    ("005 class: accuracy + 3x3 confusion", test_class_metrics_accuracy_and_confusion),
+    ("005 class: skip unknown-GT-class tracks", test_class_metrics_skips_unknown_gt_class),
+    # Task 005 — team metrics (players only, perm-invariant)
+    ("005 team: perm-invariant, players only", test_team_metrics_permutation_invariant_players_only),
+    ("005 team: excludes GK + referee", test_team_metrics_excludes_gk_and_referee),
+    # Task 005 — consistency
+    ("005 consistency: purity + switch count", test_consistency_purity_and_switches),
+    # Task 005 — graceful degradation
+    ("005 degrade: GT all -1 -> class/team skipped", test_compute_metrics_gt_all_minus1_skips_class_and_team),
+    ("005 degrade: no IoU match -> consistency kept", test_compute_metrics_no_iou_match_skips_but_keeps_consistency),
+    ("005 degrade: pred no team -> team-only skip", test_compute_metrics_pred_no_team_skips_team_only),
+    ("005 degrade: ARI/NMI skipped without sklearn", test_ari_nmi_skipped_when_sklearn_absent),
+    # Task 005 — track_attributes.json preference
+    ("005 pred-agg: prefers track_attributes.json", test_aggregate_pred_prefers_track_attributes_json),
+    ("005 pred-agg: falls back to txt without json", test_aggregate_pred_falls_back_to_txt_without_json),
+    # Task 005 — run_attribute_eval + non-fatal wiring
+    ("005 run: writes json + auto-locates sibling attrs", test_run_attribute_eval_writes_json_and_uses_sibling_attrs),
+    ("005 wiring: attribute eval failure is non-fatal", test_run_evaluation_attribute_eval_nonfatal),
 ]
 
 
