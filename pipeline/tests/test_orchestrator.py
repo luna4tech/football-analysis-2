@@ -1,10 +1,9 @@
 """
-CPU-only unit tests for the orchestrator + compare_tracks (Task 5).
+CPU-only unit tests for the orchestrator.
 
 Runs with plain python (numpy only) — NO torch / cv2 / GPU.  The orchestrator is
 exercised with an INJECTED fake runner that records the commands it would launch
-(it never starts a subprocess), and ``compare_tracks`` is driven on temp MOT
-files.
+(it never starts a subprocess).
 
 Run with:
     python pipeline/tests/test_orchestrator.py
@@ -22,7 +21,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from pipeline import orchestrator
-from pipeline.compare_tracks import compare_tracks
 from pipeline.orchestrator import (
     CommandResult,
     RunOptions,
@@ -97,7 +95,7 @@ def _make_env(tmp):
 # ===========================================================================
 # Stage-1 command wiring
 # ===========================================================================
-def test_stage1_sequential_command():
+def test_stage1_command():
     opts = RunOptions(device="gpu")
     cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
     assert cmd[0] == sys.executable, cmd
@@ -105,27 +103,14 @@ def test_stage1_sequential_command():
     assert _value_after(cmd, "--video") == "/abs/clip.mp4", cmd
     assert _value_after(cmd, "--artifacts-dir") == "/abs/artifacts", cmd
     assert _value_after(cmd, "--device") == "gpu", cmd
-    assert _value_after(cmd, "--detector") == "yolov11", cmd
     assert _value_after(cmd, "--detector-ckpt") == "checkpoints/yolov11l.pt", cmd
-    # sequential: no parallel/batch/force.
-    assert "--parallel" not in cmd, cmd
-    assert "--batch-size" not in cmd, cmd
+    # default: not forced.
     assert "--force" not in cmd, cmd
 
 
-def test_stage1_parallel_forwards_batch():
-    opts = RunOptions(device="cpu", parallel=True, batch_size=16)
-    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
-    assert "--parallel" in cmd, cmd
-    assert _value_after(cmd, "--batch-size") == "16", cmd
+def test_stage1_device_forwarded():
+    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", RunOptions(device="cpu"))
     assert _value_after(cmd, "--device") == "cpu", cmd
-
-
-def test_stage1_yolox_forwards_legacy_detector():
-    opts = RunOptions(detector="yolox")
-    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
-    assert _value_after(cmd, "--detector") == "yolox", cmd
-    assert _value_after(cmd, "--detector-ckpt") == "checkpoints/best_ckpt.pth.tar", cmd
 
 
 def test_stage1_force_adds_force():
@@ -152,8 +137,6 @@ def test_stage1_fp16_and_fuse_forwarded():
 # ===========================================================================
 def test_stage2_refine_params_forwarded():
     opts = RunOptions(
-        use_split=True,
-        use_connect=True,
         eps=0.42,
         min_samples=7,
         max_k=5,
@@ -166,8 +149,6 @@ def test_stage2_refine_params_forwarded():
     assert cmd[1] == "stage2_refine.py", cmd
     assert _value_after(cmd, "--video") == "/abs/clip.mp4", cmd
     assert _value_after(cmd, "--artifacts-dir") == "/abs/artifacts", cmd
-    assert "--use_split" in cmd, cmd
-    assert "--use_connect" in cmd, cmd
     assert _value_after(cmd, "--eps") == "0.42", cmd
     assert _value_after(cmd, "--min_samples") == "7", cmd
     assert _value_after(cmd, "--max_k") == "5", cmd
@@ -175,17 +156,6 @@ def test_stage2_refine_params_forwarded():
     assert _value_after(cmd, "--spatial_factor") == "2.5", cmd
     assert _value_after(cmd, "--merge_dist_thres") == "0.33", cmd
     assert "--force" not in cmd, cmd
-
-
-def test_stage2_no_split_no_connect_flags_omitted():
-    # --no-split -> use_split False -> flag absent (still has connect).
-    cmd_a = build_stage2_command("/v", "/a", RunOptions(use_split=False, use_connect=True))
-    assert "--use_split" not in cmd_a, cmd_a
-    assert "--use_connect" in cmd_a, cmd_a
-
-    cmd_b = build_stage2_command("/v", "/a", RunOptions(use_split=True, use_connect=False))
-    assert "--use_split" in cmd_b, cmd_b
-    assert "--use_connect" not in cmd_b, cmd_b
 
 
 # ===========================================================================
@@ -219,14 +189,16 @@ def test_run_two_stages_cwd_and_abs_paths():
         assert a1 == str(Path(artifacts).resolve()), a1
 
 
-def test_run_full_pipeline_defaults_both_components():
+def test_run_stage2_gets_refine_params():
     with tempfile.TemporaryDirectory() as tmp:
         video, artifacts = _make_env(tmp)
         runner = FakeRunner([0, 0])
         run(video, RunOptions(artifacts_dir=artifacts), runner=runner)
         cmd2 = runner.calls[1][0]
-        assert "--use_split" in cmd2, cmd2
-        assert "--use_connect" in cmd2, cmd2
+        # Stage 2 always runs the full split + connect refine; the refine params
+        # are forwarded.
+        assert _value_after(cmd2, "--eps") == "0.6", cmd2
+        assert _value_after(cmd2, "--merge_dist_thres") == "0.4", cmd2
 
 
 def test_force_all_forces_both_stages():
@@ -302,103 +274,25 @@ def test_write_summary_called_on_success():
         assert len(data["profiles"]) == 2, data["profiles"]
 
 
-# ===========================================================================
-# compare_tracks
-# ===========================================================================
-def _write_mot(path, rows):
-    """rows: list of (frame, id, x, y, w, h)."""
-    lines = []
-    for (fr, tid, x, y, w, h) in rows:
-        lines.append(f"{fr},{tid},{x},{y},{w},{h},1.0,-1,-1,-1")
-    Path(path).write_text("\n".join(lines) + "\n")
-
-
-_ROWS = [
-    (0, 1, 100.0, 100.0, 30.0, 60.0),
-    (0, 2, 200.0, 150.0, 28.0, 58.0),
-    (1, 1, 101.0, 101.0, 30.0, 60.0),
-]
-
-
-def test_compare_identical_equivalent():
-    with tempfile.TemporaryDirectory() as tmp:
-        a = Path(tmp) / "a.txt"
-        b = Path(tmp) / "b.txt"
-        _write_mot(a, _ROWS)
-        _write_mot(b, _ROWS)
-        r = compare_tracks(a, b, tol=1.0)
-        assert r.equivalent, r.report()
-        assert r.keys_match, r.report()
-        assert r.max_coord_diff == 0.0, r.max_coord_diff
-
-
-def test_compare_within_tol_jitter_equivalent():
-    with tempfile.TemporaryDirectory() as tmp:
-        a = Path(tmp) / "a.txt"
-        b = Path(tmp) / "b.txt"
-        _write_mot(a, _ROWS)
-        # jitter every coord by <= 0.5px (under the 1.0 tol)
-        jittered = [(fr, tid, x + 0.5, y - 0.5, w + 0.4, h - 0.3) for (fr, tid, x, y, w, h) in _ROWS]
-        _write_mot(b, jittered)
-        r = compare_tracks(a, b, tol=1.0)
-        assert r.equivalent, r.report()
-        assert 0.0 < r.max_coord_diff <= 1.0, r.max_coord_diff
-
-
-def test_compare_out_of_tol_not_equivalent():
-    with tempfile.TemporaryDirectory() as tmp:
-        a = Path(tmp) / "a.txt"
-        b = Path(tmp) / "b.txt"
-        _write_mot(a, _ROWS)
-        # shift one box by 5px -> exceeds tol
-        big = list(_ROWS)
-        big[0] = (0, 1, 105.0, 100.0, 30.0, 60.0)
-        _write_mot(b, big)
-        r = compare_tracks(a, b, tol=1.0)
-        assert not r.equivalent, r.report()
-        assert r.keys_match, "keys still match; failure is the coord diff"
-        assert r.max_coord_diff == 5.0, r.max_coord_diff
-
-
-def test_compare_key_mismatch_not_equivalent():
-    with tempfile.TemporaryDirectory() as tmp:
-        a = Path(tmp) / "a.txt"
-        b = Path(tmp) / "b.txt"
-        _write_mot(a, _ROWS)
-        # drop the last row in B -> (1,1) only in A
-        _write_mot(b, _ROWS[:-1])
-        r = compare_tracks(a, b, tol=1.0)
-        assert not r.equivalent, r.report()
-        assert not r.keys_match, r.report()
-        assert (1, 1) in r.only_in_a, r.only_in_a
-        assert r.only_in_b == [], r.only_in_b
-
-
 _TESTS = [
-    ("stage1 sequential command shape", test_stage1_sequential_command),
-    ("stage1 --parallel forwards --batch-size", test_stage1_parallel_forwards_batch),
-    ("stage1 --detector yolox forwards legacy detector", test_stage1_yolox_forwards_legacy_detector),
+    ("stage1 command shape", test_stage1_command),
+    ("stage1 --device forwarded", test_stage1_device_forwarded),
     ("stage1 force adds --force", test_stage1_force_adds_force),
     ("stage1 --fp16/--fuse off by default", test_stage1_fp16_and_fuse_off_by_default),
     ("stage1 --fp16/--fuse forwarded", test_stage1_fp16_and_fuse_forwarded),
     ("stage2 refine params forwarded", test_stage2_refine_params_forwarded),
-    ("stage2 no-split/no-connect flags omitted", test_stage2_no_split_no_connect_flags_omitted),
     ("run: two stages, correct cwd + abs paths to both", test_run_two_stages_cwd_and_abs_paths),
-    ("run: full pipeline defaults both components", test_run_full_pipeline_defaults_both_components),
+    ("run: stage 2 gets refine params", test_run_stage2_gets_refine_params),
     ("force-all forces both stages", test_force_all_forces_both_stages),
     ("force-stage2 forces only stage 2", test_force_stage2_only),
     ("stage1 failure aborts before stage2", test_stage1_failure_aborts_before_stage2),
     ("write_summary called + aggregates on success", test_write_summary_called_on_success),
-    ("compare: identical -> equivalent", test_compare_identical_equivalent),
-    ("compare: within-tol jitter -> equivalent", test_compare_within_tol_jitter_equivalent),
-    ("compare: out-of-tol -> not equivalent", test_compare_out_of_tol_not_equivalent),
-    ("compare: key mismatch -> not equivalent", test_compare_key_mismatch_not_equivalent),
 ]
 
 
 def main() -> int:
     print("=" * 60)
-    print("orchestrator + compare_tracks unit tests (CPU-only, fake runner)")
+    print("orchestrator unit tests (CPU-only, fake runner)")
     print("=" * 60)
     for test_name, fn in _TESTS:
         run_test(test_name, fn)

@@ -178,15 +178,15 @@ This runs Stage 1 (tracking) then Stage 2 (refine) and writes everything under
 `OUTPUT_DIR/<STEM>/` on Drive (see the layout at the bottom). The orchestrator streams each
 stage's log live and prints a profiling summary at the end.
 
-**Faster perception (optional):** add the opt-in parallel path (batched detect+ReID + prefetch
-decode). Lower `--batch-size` if you hit GPU out-of-memory:
+**Faster perception (optional):** add `--fp16` (half-precision detector inference; the main
+throughput lever, ~1.5–2× on GPU) and optionally `--fuse`:
 
 ```python
 !python -m pipeline run \
     --video "$VIDEO" \
     --artifacts-dir "$OUTPUT_DIR" \
     --device gpu \
-    --parallel --batch-size 8
+    --fp16 --fuse
 ```
 
 > **Cache caveat:** stages skip work when their output is newer than their input. Re-running the
@@ -224,19 +224,6 @@ result (CPU-only, no GPU needed). Frames are 0-based, so do **not** pass `--one_
 !cat "$OUTPUT_DIR/$STEM/profiles/summary.md"
 ```
 
-**(Optional) Confirm `--parallel` matches sequential.** Run each mode into a *separate* artifacts
-dir, then diff the two `tracks.txt` with the tolerant comparator (parity is exact only up to
-floating-point noise):
-
-```python
-!python -m pipeline run --video "$VIDEO" --artifacts-dir /content/_seq --device gpu --force-stage1
-!python -m pipeline run --video "$VIDEO" --artifacts-dir /content/_par --device gpu --parallel --batch-size 8 --force-stage1
-!python -m pipeline compare \
-    --a "/content/_seq/$STEM/01_track/tracks.txt" \
-    --b "/content/_par/$STEM/01_track/tracks.txt" \
-    --tol 1.0
-```
-
 ---
 
 ## Output layout on Drive
@@ -262,8 +249,7 @@ After a run, `Colab Notebooks/football-analysis-project/output/gta-track/<STEM>/
 
 ## Tips & troubleshooting
 
-- **GPU out of memory** in `--parallel`: lower `--batch-size` (e.g. 4 or 2), or drop `--parallel`
-  to run sequentially.
+- **GPU out of memory**: try `--fp16` (roughly halves activation memory), or process shorter clips.
 - **`FileNotFoundError` for a checkpoint**: re-check Step 4 — the symlinks must resolve to real
   files in your Drive `checkpoints/` folder, and `yolov11l.pt` plus
   `sports_model.pth.tar-60` must keep those exact names.
@@ -274,8 +260,7 @@ After a run, `Colab Notebooks/football-analysis-project/output/gta-track/<STEM>/
   (see Step 5).
 - **Path with a space** (`Colab Notebooks`): always keep the `"$VAR"` quotes in the `!` cells.
 - **Wrong/blank detections**: ensure `yolov11l.pt` is the custom Ultralytics YOLOv11 checkpoint
-  you intend to use. For the legacy detector, run with `--detector yolox` and ensure
-  `best_ckpt.pth.tar` matches `yolox/yolox_x_ch_sportsmot.py`.
+  you intend to use.
 - **Running stages independently** (e.g. only refine, from a cached `tracklets.pkl`) is documented
   in [USER_GUIDE.md](USER_GUIDE.md) — the Colab commands are the same, just `cd gta-link` and call
   `stage2_refine.py` with the shared `--artifacts-dir`.

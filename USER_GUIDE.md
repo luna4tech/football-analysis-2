@@ -64,9 +64,6 @@ inputs (mtime-based). Stage 1 keys on the **video** mtime; Stage 2 keys on
   Stage 2 needs **no** checkpoint — it reuses the embeddings already saved in
   `tracklets.pkl`.
 
-  The original YOLOX detector is still available with `--detector yolox`; for
-  that fallback, also place `Deep-EIoU/Deep-EIoU/checkpoints/best_ckpt.pth.tar`.
-
 All commands below assume your shell's CWD is the **repo root**.
 
 ---
@@ -78,9 +75,9 @@ python -m pipeline run --video clip.mp4
 ```
 
 This runs Stage 1 with the default YOLOv11 detector checkpoint
-`checkpoints/yolov11l.pt`, then Stage 2 with the **full** refinement (both
-`--use_split` and `--use_connect` on by default), streaming each stage's live
-progress, and finally writes `profiles/summary.md`.
+`checkpoints/yolov11l.pt`, then Stage 2 with the full refinement (split +
+connect), streaming each stage's live progress, and finally writes
+`profiles/summary.md`.
 
 Common options:
 
@@ -91,20 +88,8 @@ python -m pipeline run --video clip.mp4 --artifacts-dir /content/artifacts
 # Use a custom YOLOv11 checkpoint path
 python -m pipeline run --video clip.mp4 --detector-ckpt /abs/path/yolov11l.pt
 
-# Fall back to the original YOLOX detector
-python -m pipeline run --video clip.mp4 --detector yolox \
-    --detector-ckpt checkpoints/best_ckpt.pth.tar
-
 # Stage-1 throughput: --fp16 is the main lever (~1.5-2x on GPU). See §8.
 python -m pipeline run --video clip.mp4 --fp16 --fuse
-
-# --parallel adds decode/compute overlap (small extra gain; NOT a substitute
-# for --fp16 — batching alone does not speed up the saturated detector).
-python -m pipeline run --video clip.mp4 --fp16 --parallel --batch-size 16
-
-# Drop one refine component (at least one must remain)
-python -m pipeline run --video clip.mp4 --no-split      # connect/merge only
-python -m pipeline run --video clip.mp4 --no-connect     # split only
 
 # Tune refine params (see the cache caveat in §5 — pair these with --force-stage2)
 python -m pipeline run --video clip.mp4 --eps 0.5 --merge_dist_thres 0.35 --force-stage2
@@ -128,23 +113,15 @@ python tools/stage1_track.py \
     --video /abs/path/clip.mp4 \
     --artifacts-dir /abs/path/artifacts \
     --device gpu --fp16          # --fp16 = main throughput lever (see §8)
-# YOLOX fallback:
-python tools/stage1_track.py --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/artifacts --detector yolox \
-    --detector-ckpt checkpoints/best_ckpt.pth.tar
-# parallel variant (decode/compute overlap on top of --fp16):
-python tools/stage1_track.py --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/artifacts --fp16 --parallel --batch-size 16
 ```
 
-**Stage 2 (refine)** — CWD `gta-link`:
+**Stage 2 (refine)** — CWD `gta-link` (always runs split + connect):
 
 ```bash
 cd gta-link
 python stage2_refine.py \
     --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/artifacts \
-    --use_split --use_connect
+    --artifacts-dir /abs/path/artifacts
 ```
 
 > Use **absolute** `--video` / `--artifacts-dir` here. Because each script runs
@@ -217,30 +194,6 @@ python tools/render_from_txt.py --path /abs/path/clip.mp4 \
 Each writes `<txt>_rendered.mp4` next to the `.txt`. (`render_from_txt.py` is
 cv2+numpy only — no GPU.)
 
-### 6c. Parallel == Sequential equivalence check
-
-Run Stage 1 both ways into separate artifact dirs, then diff the two `tracks.txt`
-**tolerantly** (parity is floating-point nondeterministic, so a strict byte-diff
-is the *wrong* tool):
-
-```bash
-# sequential
-python -m pipeline run --video clip.mp4 --artifacts-dir /tmp/seq --force-stage1
-# parallel
-python -m pipeline run --video clip.mp4 --artifacts-dir /tmp/par --parallel --batch-size 16 --force-stage1
-
-python -m pipeline compare \
-    --a /tmp/seq/<stem>/01_track/tracks.txt \
-    --b /tmp/par/<stem>/01_track/tracks.txt \
-    --tol 1.0
-```
-
-`compare` matches rows by `(frame, id)` and reports key-set differences plus the
-max/mean absolute box-coordinate difference. It prints **EQUIVALENT** (exit code
-0) when the key sets match and the max coord diff is ≤ `--tol` (default 1.0 px),
-otherwise **NOT EQUIVALENT** (exit code 1). A handful of px of jitter is expected
-and fine; large coord diffs or differing key sets indicate a real divergence.
-
 ---
 
 ## 7. Inspect profiling
@@ -257,7 +210,7 @@ Per-stage JSON fields:
 | `gpu_peak_mb` | peak CUDA memory (MB); `null` without a GPU |
 | `cpu_rss_start_mb` / `cpu_rss_end_mb` | process RSS (MB) before/after (`null` if `psutil`/`resource` unavailable) |
 | `cpu_peak_mb` | peak RSS (MB) when available, else `null` |
-| `io` | caller metadata: frame counts, track counts, `emb_dim`, `mode` (sequential/parallel), `batch_size`, refine params, … |
+| `io` | caller metadata: frame counts, track counts, `emb_dim`, detector, refine params, … |
 
 ```bash
 cat /abs/path/artifacts/<stem>/profiles/summary.md       # human-readable table
@@ -266,17 +219,15 @@ python -c "import json,sys; print(json.load(open(sys.argv[1]))['totals'])" \
 ```
 
 `summary.md` has one row per stage plus a **TOTAL** row (summed wall time, max
-GPU peak). Use the `io` block to compare a sequential vs a parallel run (same
-`n_output_rows`/`n_unique_tracks`, different `wall_time_s`).
+GPU peak). Use the `io` block to inspect per-stage counts and the refine params
+used.
 
 ---
 
-## 8. Throughput: `--fp16` first, then parallelization
-
-### 8a. `--fp16` is the main throughput lever
+## 8. Throughput: `--fp16`
 
 Stage 1 detector inference is usually the bottleneck. Half-precision inference
-is the first throughput lever to try:
+is the main throughput lever:
 
 ```bash
 python -m pipeline run --video clip.mp4 --device gpu --fp16
@@ -286,61 +237,7 @@ python -m pipeline run --video clip.mp4 --device gpu --fp16 --fuse
 
 On a modern GPU (T4/A100) `--fp16` typically gives **~1.5–2× Stage-1 throughput**
 and roughly halves activation memory, with no meaningful accuracy change for
-inference. Try this **before** reaching for `--parallel`.
-
-### 8b. What `--parallel` actually buys (and what it doesn't)
-
-Stage 1 has two paths producing the **same artifact contract**:
-
-- **sequential** (default): one frame at a time — decode → detect → ReID → track,
-  all on one thread.
-- **`--parallel --batch-size N`**: a **3-stage pipeline** — a prefetch thread
-  decodes frames, a producer thread runs **batched** detect+ReID on the GPU, and
-  the calling thread runs the tracker in strict frame order. So the GPU computes
-  batch *N+1* while the tracker drains batch *N* (decode ∥ GPU ∥ track).
-
-**What it does NOT do — batching does not speed up a compute-saturated detector.**
-Because one frame already maxes out the GPU's compute, batching N frames runs the
-same total FLOPs with no idle time to fill: throughput stays flat while VRAM
-grows ~N×. The pipeline's win is **overlap**, not batching — it hides the
-per-frame CPU tail (decode + tracking + postprocess) behind GPU compute instead
-of running it serially.
-
-How big is that overlap win? It equals the share of wall time spent **off** the
-GPU. On a T4 in FP32 the detector dominates (GPU ~80% busy), so there is only
-~20% tail to hide and the early measured gain was small (~5%). **Under `--fp16`
-the detector gets ~2× cheaper but the CPU tail does not, so the tail becomes a
-much larger share — and the pipeline overlap matters more.** Rule of thumb:
-the lower your `sm%` during a run, the more `--parallel` buys you.
-
-> The "fps" printed in parallel mode counts only the cheap CPU tracking step, not
-> the GPU work — it is **not** the pipeline rate. Judge speed by the
-> **Stage 1 wall** line at the end of the run.
-
-**Use `--parallel` when** there is a non-trivial off-GPU tail to hide — i.e.
-`sm%` is well under 100 (you're running `--fp16`, a fast GPU, high-res decode,
-or heavy tracking) and you have VRAM to spare. If `sm%` is pinned near 100,
-the GPU is the wall and overlap has nothing to reclaim; reach for `--fp16` first.
-
-**Choosing `--batch-size` against VRAM:** batch memory scales roughly linearly
-with batch size. Start at `8`, raise toward `16` only while watching
-`gpu_peak_mb` in the profile and `nvidia-smi`; if you hit OOM, halve it. Batches
-larger than what keeps the GPU continuously fed add latency-to-first-output and
-VRAM with **no** throughput gain.
-
-**Prefer sequential when:**
-- **debugging** — simplest control flow, deterministic ordering, easiest to read.
-- **very short clips** — the prefetch/batching overhead isn't amortized.
-- **low VRAM** — batching can OOM; sequential has the smallest footprint.
-- **strict reproducibility** — sequential is the behavior reference.
-
-> **FP-nondeterminism caveat:** the parallel path is equal to sequential only
-> *up to floating-point nondeterminism*. Batched GPU matmul/NMS kernels can
-> differ from single-image ones in the last FP bits, which can **rarely** flip a
-> detection sitting exactly on a confidence/NMS threshold. So `--parallel` output
-> is **not** bit-identical to sequential. Verify equivalence with the tolerant
-> `python -m pipeline compare` check (§6c), **not** a strict diff. If you need
-> exact reproducibility, use the sequential path.
+inference.
 
 ---
 
@@ -357,9 +254,4 @@ python -m pipeline run --video clip.mp4
 python Deep-EIoU/Deep-EIoU/tools/count_tracks.py artifacts/clip/01_track/tracks.txt
 python Deep-EIoU/Deep-EIoU/tools/count_tracks.py artifacts/clip/02_refine/refined.txt
 python Deep-EIoU/Deep-EIoU/tools/render_from_txt.py --path clip.mp4 --txt artifacts/clip/02_refine/refined.txt
-
-# parallel == sequential
-python -m pipeline run --video clip.mp4 --artifacts-dir /tmp/seq --force-stage1
-python -m pipeline run --video clip.mp4 --artifacts-dir /tmp/par --parallel --batch-size 16 --force-stage1
-python -m pipeline compare --a /tmp/seq/clip/01_track/tracks.txt --b /tmp/par/clip/01_track/tracks.txt
 ```

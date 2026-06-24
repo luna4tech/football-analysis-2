@@ -4,6 +4,9 @@ Stage 2 (refine) entrypoint: a thin single-video wrapper around GtaLink's
 and writes the contract ``refined.txt``, reusing refine_tracklets' algorithm
 functions UNCHANGED, with caching + profiling.
 
+The refinement is always the FULL pipeline: split ID-switched tracklets, then
+connect/merge fragmented ones.
+
 Artifact contract
 -----------------
     <artifacts>/<video_stem>/01_track/tracklets.pkl   (input, from Stage 1)
@@ -14,7 +17,7 @@ Run with CWD = ``gta-link`` so that ``import refine_tracklets`` and
 ``import Tracklet`` both resolve to the sibling files in this directory::
 
     cd gta-link
-    python stage2_refine.py --video /path/to/clip.mp4 --use_split --use_connect
+    python stage2_refine.py --video /path/to/clip.mp4
 
 ``--video`` is used ONLY to locate the artifact directory (via the same
 ``get_artifact_paths`` Stage 1 uses); Stage 2 does NOT read the video itself.
@@ -30,29 +33,17 @@ runs its ``from Tracklet import Tracklet`` line, which imports
 pickle needs.  We therefore do NOT re-register or shadow the ``Tracklet`` module
 name; the natural import resolves it.
 
-DELIBERATE DEVIATION from refine_tracklets.main()
--------------------------------------------------
-The original ``refine_tracklets.main()`` computes the distance matrix and calls
-``merge_tracklets`` **unconditionally** — it does NOT gate merging on
-``--use_connect`` (it only gates *splitting* on ``--use_split``).  This wrapper
-INTENTIONALLY gates the merge step on ``--use_connect`` (see ``run_refine``) so
-the documented flag semantics (README: "--use_connect: use the connecting
-component") actually hold.  Consequences:
-
-  * Full pipeline (``--use_split --use_connect``) is IDENTICAL to the original.
-  * ``--use_split`` only -> split, then NO merge (original would also merge).
-  * ``--use_connect`` only -> NO split, then merge (matches original).
-  * neither -> raises (matches original).
-
-The algorithm functions in ``refine_tracklets.py`` are reused verbatim; only the
-step-decision orchestration differs, and only in the ``--use_split``-only case.
-This is flagged for ratification in the task report.
+Connect/merge step
+------------------
+The connect step uses ``_fast_connect`` — an exact, batched replacement for
+refine_tracklets' ``get_distance_matrix`` + ``merge_tracklets`` (same output up
+to float rounding, orders of magnitude faster).  The split component and the
+spatial-constraint gate are reused from ``refine_tracklets.py`` UNCHANGED.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import os.path as osp
 import pickle
 import sys
@@ -89,30 +80,22 @@ class RefineDeps:
 
       * ``get_spatial_constraints(tid2track, factor) -> (max_x, max_y)``
       * ``split_tracklets(tmp, eps, max_k, min_samples, len_thres) -> dict``
-      * ``get_distance_matrix(tracklets) -> ndarray``
-      * ``merge_tracklets(tracklets, seq2Dist, Dist, seq_name, max_x_range,
-                          max_y_range, merge_dist_thres) -> dict``
+      * ``check_spatial_constraints(trk1, trk2, max_x, max_y) -> bool`` — the
+        spatial gate used by the batched connect step (``_fast_connect``).
       * ``save_results(out_path, tracklets) -> None``
-      * ``check_spatial_constraints(trk1, trk2, max_x, max_y) -> bool`` — only
-        needed by the ``--fast_merge`` path (``_fast_connect``); the default
-        slow path never touches it, so it stays optional (``None``).
     """
 
     def __init__(
         self,
         get_spatial_constraints,
         split_tracklets,
-        get_distance_matrix,
-        merge_tracklets,
+        check_spatial_constraints,
         save_results,
-        check_spatial_constraints=None,
     ) -> None:
         self.get_spatial_constraints = get_spatial_constraints
         self.split_tracklets = split_tracklets
-        self.get_distance_matrix = get_distance_matrix
-        self.merge_tracklets = merge_tracklets
-        self.save_results = save_results
         self.check_spatial_constraints = check_spatial_constraints
+        self.save_results = save_results
 
 
 def _build_deps() -> RefineDeps:
@@ -128,18 +111,16 @@ def _build_deps() -> RefineDeps:
     return RefineDeps(
         get_spatial_constraints=refine_tracklets.get_spatial_constraints,
         split_tracklets=refine_tracklets.split_tracklets,
-        get_distance_matrix=refine_tracklets.get_distance_matrix,
-        merge_tracklets=refine_tracklets.merge_tracklets,
-        save_results=refine_tracklets.save_results,
         check_spatial_constraints=refine_tracklets.check_spatial_constraints,
+        save_results=refine_tracklets.save_results,
     )
 
 
 def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
     """Exact, batched replacement for ``get_distance_matrix`` + ``merge_tracklets``.
 
-    Produces the SAME merged ``{tid: Tracklet}`` as the slow path (up to float
-    rounding), but:
+    Produces the SAME merged ``{tid: Tracklet}`` as the original per-pair path
+    (up to float rounding), but:
 
       * builds the all-pairs cosine-distance matrix in ONE batched matmul
         instead of ~N**2 per-pair ``get_distance`` calls (each of which moves
@@ -149,7 +130,7 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
 
     Why it is EXACT, not an approximation
     -------------------------------------
-    The slow ``get_distance(A, B)`` for non-overlapping tracklets is
+    The per-pair ``get_distance(A, B)`` for non-overlapping tracklets is
     ``mean over (i in A, j in B) of (1 - cosine(f_i, g_j))``.  Because the dot
     product is bilinear, the average of the pairwise cosine *similarities*
     equals the dot product of the per-tracklet means of the L2-normalized
@@ -159,25 +140,19 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
 
     so ONE mean-of-normalized-features embedding per tracklet reproduces the
     full pairwise mean exactly.  A merge uses a frame-count-weighted mean, so
-    the merged embedding equals what the slow path computes from the
+    the merged embedding equals what the per-pair path computes from the
     concatenated feature lists.  Overlapping tracklets get distance 1 (max),
     matching ``get_distance``'s ``set(times) & set(times)`` short-circuit —
     here via a batched occupancy product.
 
     The greedy hierarchical merge order, the spatial-constraint gate, and the
     "block this pair" branch are reproduced exactly so the merge SEQUENCE (and
-    therefore the output) matches ``merge_tracklets``; only the distance
-    *arithmetic* is reorganized.  ``check_spatial_constraints`` and
+    therefore the output) matches the original ``merge_tracklets``; only the
+    distance *arithmetic* is reorganized.  ``check_spatial_constraints`` and
     ``save_results`` read only ``times`` / ``bboxes`` (never ``features``), so
     this skips concatenating the (large) per-tracklet feature lists.
     """
     import numpy as np
-
-    if deps.check_spatial_constraints is None:
-        raise ValueError(
-            "fast_merge requires deps.check_spatial_constraints; build deps via "
-            "_build_deps() (it wires refine_tracklets.check_spatial_constraints)."
-        )
 
     tids = list(tracklets.keys())
     n = len(tids)
@@ -256,40 +231,38 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
 
 
 def run_refine(tmp, refined_txt, params, deps, seq_name):
-    """Mirror refine_tracklets.main()'s per-seq body for ONE pkl's tracklets.
+    """Refine ONE pkl's tracklets: split, then connect/merge.
 
-    This is the step-decision core, factored out and dependency-injected so it
-    is unit-testable on CPU with stubs.  It reproduces the original per-sequence
-    pipeline EXCEPT that the merge step is gated on ``params["use_connect"]``
-    (see the module docstring's "DELIBERATE DEVIATION" note).
+    Mirrors refine_tracklets.main()'s per-seq body (split THEN connect) for a
+    single video's ``{tid: Tracklet}``, factored out and dependency-injected so
+    it is unit-testable on CPU with stubs.  The connect step uses the exact
+    batched ``_fast_connect``.
 
     Equivalent original code (refine_tracklets.main inner body)::
 
         max_x, max_y = get_spatial_constraints(tmp, spatial_factor)
-        split = split_tracklets(tmp, ...) if use_split else tmp
-        Dist = get_distance_matrix(split)          # original: ALWAYS
-        out  = merge_tracklets(split, {}, Dist...)  # original: ALWAYS
+        split = split_tracklets(tmp, ...)
+        Dist  = get_distance_matrix(split)
+        out   = merge_tracklets(split, {}, Dist, ...)
         save_results(out_path, out)
 
-    Here, ``get_distance_matrix`` + ``merge_tracklets`` run only when
-    ``use_connect`` is set.
+    Here, ``get_distance_matrix`` + ``merge_tracklets`` are replaced by the
+    exact batched ``_fast_connect``.
 
     Parameters
     ----------
     tmp:
         ``{track_id: Tracklet}`` loaded from ``tracklets.pkl`` (mutated in place
-        by ``split_tracklets`` / ``merge_tracklets``, exactly as the original).
+        by ``split_tracklets`` / ``_fast_connect``, exactly as the original).
     refined_txt:
         Output path for the refined MOT txt (the contract ``refined.txt``).
     params:
-        Dict with keys: ``use_split``, ``use_connect``, ``min_len``, ``eps``,
-        ``min_samples``, ``max_k``, ``spatial_factor``, ``merge_dist_thres``,
-        and optional ``fast_merge`` (bool; default False — use ``_fast_connect``
-        for the connect step instead of get_distance_matrix + merge_tracklets).
+        Dict with keys: ``min_len``, ``eps``, ``min_samples``, ``max_k``,
+        ``spatial_factor``, ``merge_dist_thres``.
     deps:
         A :class:`RefineDeps` bundle of the algorithm callables.
     seq_name:
-        Sequence name passed to ``merge_tracklets`` (the video stem).
+        Sequence name (the video stem); kept for parity / logging.
 
     Returns
     -------
@@ -297,16 +270,6 @@ def run_refine(tmp, refined_txt, params, deps, seq_name):
         IO counts for profiling: ``n_tracklets_in``, ``n_tracklets_after_split``,
         ``n_tracklets_out``.
     """
-    use_split = params["use_split"]
-    use_connect = params["use_connect"]
-
-    # Require at least one component, exactly like the original main() does.
-    if not use_split and not use_connect:
-        raise ValueError(
-            "Both use_split and use_connect are false, must at least use one "
-            "of --use_split / --use_connect."
-        )
-
     n_tracklets_in = len(tmp)
 
     # Spatial constraints come from the ORIGINAL tracklets (factor-scaled
@@ -315,67 +278,36 @@ def run_refine(tmp, refined_txt, params, deps, seq_name):
         tmp, params["spatial_factor"]
     )
 
-    # --- split component (gated on use_split, same as original) ---
-    if use_split:
-        split = deps.split_tracklets(
-            tmp,
-            eps=params["eps"],
-            max_k=params["max_k"],
-            min_samples=params["min_samples"],
-            len_thres=params["min_len"],
-        )
-    else:
-        split = tmp
+    # --- split component (split ID-switched tracklets) ---
+    split = deps.split_tracklets(
+        tmp,
+        eps=params["eps"],
+        max_k=params["max_k"],
+        min_samples=params["min_samples"],
+        len_thres=params["min_len"],
+    )
     n_tracklets_after_split = len(split)
 
-    # --- connect/merge component (gated on use_connect — the DEVIATION) ---
-    # Original main() runs get_distance_matrix + merge_tracklets UNCONDITIONALLY;
-    # we gate them on use_connect so --use_split-only does not also merge.
-    #
-    # The connect step is the slow part (the original computes an N**2 distance
-    # matrix one pair at a time, each a GPU round-trip, then merges hierarchically
-    # recomputing rows the same way). The prints below flush so the otherwise
-    # SILENT multi-minute stretch shows progress in a non-TTY (subprocess) log.
-    use_fast = params.get("fast_merge", False)
-    if use_connect:
-        if use_fast:
-            print(
-                "[stage2] connect (fast): batched distance + merge over {} "
-                "tracklets...".format(n_tracklets_after_split),
-                flush=True,
-            )
-            out = _fast_connect(
-                split,
-                deps,
-                max_x_range=max_x_range,
-                max_y_range=max_y_range,
-                merge_dist_thres=params["merge_dist_thres"],
-            )
-        else:
-            print(
-                "[stage2] connect (slow): building {n}x{n} distance "
-                "matrix...".format(n=n_tracklets_after_split),
-                flush=True,
-            )
-            Dist = deps.get_distance_matrix(split)
-            print("[stage2] connect (slow): merging tracklets...", flush=True)
-            # merge_tracklets mutates `split` and takes a seq2Dist debug dict; pass
-            # an empty dict and the video stem as seq_name (per the task brief).
-            out = deps.merge_tracklets(
-                split,
-                {},
-                Dist,
-                seq_name=seq_name,
-                max_x_range=max_x_range,
-                max_y_range=max_y_range,
-                merge_dist_thres=params["merge_dist_thres"],
-            )
-        print(
-            "[stage2] connect: done ({} tracklets after merge).".format(len(out)),
-            flush=True,
-        )
-    else:
-        out = split
+    # --- connect/merge component (exact batched _fast_connect) ---
+    # The prints flush so the otherwise SILENT stretch shows progress in a
+    # non-TTY (subprocess) log.
+    print(
+        "[stage2] connect: batched distance + merge over {} tracklets...".format(
+            n_tracklets_after_split
+        ),
+        flush=True,
+    )
+    out = _fast_connect(
+        split,
+        deps,
+        max_x_range=max_x_range,
+        max_y_range=max_y_range,
+        merge_dist_thres=params["merge_dist_thres"],
+    )
+    print(
+        "[stage2] connect: done ({} tracklets after merge).".format(len(out)),
+        flush=True,
+    )
     n_tracklets_out = len(out)
 
     deps.save_results(refined_txt, out)
@@ -401,7 +333,7 @@ def make_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         description="Stage 2 — GtaLink tracklet refinement (single video, "
-        "contract CLI with caching + profiling)."
+        "split + connect, with caching + profiling)."
     )
 
     # --- contract path resolution (identical to Stage 1) ---
@@ -426,11 +358,6 @@ def make_parser() -> argparse.ArgumentParser:
     )
 
     # --- refine params (same names + defaults as refine_tracklets.parse_args) ---
-    parser.add_argument(
-        "--use_split",
-        action="store_true",
-        help="If using split component.",
-    )
     parser.add_argument(
         "--min_len",
         type=int,
@@ -458,11 +385,6 @@ def make_parser() -> argparse.ArgumentParser:
         help="Maximum number of clusters/subtracklets output by splitting.",
     )
     parser.add_argument(
-        "--use_connect",
-        action="store_true",
-        help="If using connecting component.",
-    )
-    parser.add_argument(
         "--spatial_factor",
         type=float,
         default=1.0,
@@ -474,34 +396,10 @@ def make_parser() -> argparse.ArgumentParser:
         default=0.4,
         help="Minimum cosine distance between two tracklets for merging.",
     )
-    parser.add_argument(
-        "--fast_merge",
-        action="store_true",
-        default=False,
-        help="Use the exact batched connect/merge (_fast_connect) instead of the "
-        "original per-pair GPU path. Same output (up to float rounding), but "
-        "the O(N^2) distance matrix becomes one matmul and per-merge row "
-        "updates become one matvec — seconds instead of many minutes. Only "
-        "affects --use_connect; splitting is unchanged.",
-    )
     return parser
 
 
 def main(args) -> None:
-    # Determine the process label (also validates at-least-one-flag, like the
-    # original main()).
-    if args.use_split and args.use_connect:
-        process = "Split+Connect"
-    elif args.use_split:
-        process = "Split"
-    elif args.use_connect:
-        process = "Connect"
-    else:
-        raise ValueError(
-            "Both use_split and use_connect are false, must at least use one "
-            "of --use_split / --use_connect."
-        )
-
     paths = get_artifact_paths(args.video, base_dir=args.artifacts_dir)
     ensure_dirs(paths)
 
@@ -535,33 +433,27 @@ def main(args) -> None:
     seq_name = osp.splitext(osp.basename(args.video))[0]  # video stem
 
     params = {
-        "use_split": args.use_split,
-        "use_connect": args.use_connect,
         "min_len": args.min_len,
         "eps": args.eps,
         "min_samples": args.min_samples,
         "max_k": args.max_k,
         "spatial_factor": args.spatial_factor,
         "merge_dist_thres": args.merge_dist_thres,
-        "fast_merge": args.fast_merge,
     }
 
     io_counts = {
-        "process": process,
+        "process": "Split+Connect",
         "n_tracklets_in": 0,
         "n_tracklets_after_split": 0,
         "n_tracklets_out": 0,
         "n_output_rows": 0,
         # key params, recorded for the profile.
-        "use_split": args.use_split,
-        "use_connect": args.use_connect,
         "eps": args.eps,
         "min_samples": args.min_samples,
         "max_k": args.max_k,
         "merge_dist_thres": args.merge_dist_thres,
         "min_len": args.min_len,
         "spatial_factor": args.spatial_factor,
-        "fast_merge": args.fast_merge,
     }
 
     with profile_stage("02_refine", paths, extra=io_counts):
