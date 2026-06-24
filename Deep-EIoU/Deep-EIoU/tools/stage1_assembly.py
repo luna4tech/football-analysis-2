@@ -30,6 +30,14 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 
 
+# Canonical class IDs (project-wide convention; these three packages run as
+# separate subprocesses with no shared imports, so this is a documented
+# convention kept as local literals, not a shared module).
+#   0 = player, 1 = goalkeeper, 2 = referee, -1 = unknown/legacy.
+CLASS_UNKNOWN = -1
+_NAME_TO_CANONICAL = {"player": 0, "goalkeeper": 1, "referee": 2}
+
+
 def _array_like_to_numpy(value: Any) -> "np.ndarray":
     """Convert torch/numpy-like values to a NumPy array without importing torch."""
     if hasattr(value, "detach"):
@@ -41,13 +49,41 @@ def _array_like_to_numpy(value: Any) -> "np.ndarray":
     return np.asarray(value)
 
 
+def _raw_class_to_canonical(raw_cls: "np.ndarray", names: Any) -> "np.ndarray":
+    """Map raw detector class indices to canonical class IDs by **name**.
+
+    ``names`` is the Ultralytics result's id->name mapping (a dict or list).
+    Each raw class index is resolved to its name string and remapped to the
+    canonical ID via ``player``/``goalkeeper``/``referee`` (case-insensitive).
+    Any name that doesn't match (or a missing/unknown index) becomes
+    ``CLASS_UNKNOWN`` (-1).
+    """
+    canonical = np.full(raw_cls.shape[0], CLASS_UNKNOWN, dtype=np.float32)
+    if names is None:
+        return canonical
+    for i, raw in enumerate(raw_cls):
+        key = int(raw)
+        if isinstance(names, dict):
+            name = names.get(key)
+        elif 0 <= key < len(names):
+            name = names[key]
+        else:
+            name = None
+        if name is None:
+            continue
+        canonical[i] = _NAME_TO_CANONICAL.get(str(name).strip().lower(), CLASS_UNKNOWN)
+    return canonical
+
+
 def ultralytics_result_to_yolox_output(result: Any) -> "np.ndarray | None":
     """Convert one Ultralytics detection result to DeepEIoU's YOLOX row shape.
 
     Output rows are ``[x1, y1, x2, y2, score, class_conf, class_id]``.  The
     tracker multiplies ``score * class_conf`` for 7-column rows, so
     ``class_conf`` is fixed at 1.0 to preserve Ultralytics' confidence as the
-    effective tracking score.
+    effective tracking score.  ``class_id`` is the **canonical** class ID
+    (0=player, 1=goalkeeper, 2=referee, -1=unknown), remapped by name from the
+    detector's raw class via the result's ``names`` mapping.
     """
     boxes = getattr(result, "boxes", None)
     if boxes is None:
@@ -67,32 +103,43 @@ def ultralytics_result_to_yolox_output(result: Any) -> "np.ndarray | None":
         )
 
     class_conf = np.ones_like(conf, dtype=np.float32)
+    canonical = _raw_class_to_canonical(
+        cls.reshape(-1), getattr(result, "names", None)
+    ).reshape(-1, 1)
     return np.concatenate(
         [
             xyxy,
             conf.astype(np.float32, copy=False),
             class_conf,
-            cls.astype(np.float32, copy=False),
+            canonical,
         ],
         axis=1,
     )
 
 
-# MOT result line format.  This is byte-for-byte the string demo.py appends to
-# its ``results`` list:
-#   f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-# Keeping it in one place guarantees tracks.txt parity.
-def format_mot_line(frame_id: int, track_id: int, tlwh: Sequence[float], score: float) -> str:
+# MOT result line format.  The first 7 columns are byte-for-byte what demo.py
+# appends to its ``results`` list:
+#   f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},..."
+# Column 8 now carries the per-frame canonical class id (was a fixed -1); cols
+# 9-10 stay -1,-1.  Keeping it in one place guarantees tracks.txt parity.
+def format_mot_line(
+    frame_id: int,
+    track_id: int,
+    tlwh: Sequence[float],
+    score: float,
+    class_id: int = CLASS_UNKNOWN,
+) -> str:
     """Return the MOT-format line for one surviving detection.
 
-    Matches demo.py's ``results.append(...)`` exactly: 0-based ``frame_id``,
-    ``:.2f`` formatting on the four box coordinates and the score, trailing
-    ``-1,-1,-1`` and a newline.
+    Matches demo.py's ``results.append(...)`` on the first 7 columns: 0-based
+    ``frame_id``, ``:.2f`` formatting on the four box coordinates and the score.
+    Column 8 is the per-frame canonical ``class_id`` (``-1`` when unknown), then
+    a trailing ``-1,-1`` and a newline.
     """
     return (
         f"{frame_id},{track_id},"
         f"{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},"
-        f"{score:.2f},-1,-1,-1\n"
+        f"{score:.2f},{int(class_id)},-1,-1\n"
     )
 
 
@@ -164,6 +211,7 @@ class TrackletAssembler:
         tlwh: Sequence[float],
         score: float,
         feat: "np.ndarray",
+        class_id: int = CLASS_UNKNOWN,
     ) -> None:
         """Append one surviving detection to both the MOT list and its Tracklet.
 
@@ -181,9 +229,14 @@ class TrackletAssembler:
         feat:
             The track's ``curr_feat`` — already L2-normalized.  Stored as
             ``np.float32`` and NOT re-normalized.
+        class_id:
+            Canonical class id for this frame's matched detection
+            (0=player, 1=goalkeeper, 2=referee, -1=unknown).  Written to MOT
+            column 8 and appended to the Tracklet's per-frame ``class_ids``.
         """
-        # MOT line (identical formatting to demo.py).
-        self.results.append(format_mot_line(frame_id, track_id, tlwh, score))
+        class_id = int(class_id)
+        # MOT line (first 7 cols identical to demo.py; col 8 = canonical class).
+        self.results.append(format_mot_line(frame_id, track_id, tlwh, score, class_id))
 
         # Box stored exactly as demo.py's tracks.txt row -> [l, t, w, h].
         bbox = [float(tlwh[0]), float(tlwh[1]), float(tlwh[2]), float(tlwh[3])]
@@ -192,11 +245,11 @@ class TrackletAssembler:
 
         track = self.tracklets.get(track_id)
         if track is None:
-            track = self._tracklet_cls(track_id, frame_id, score, bbox)
+            track = self._tracklet_cls(track_id, frame_id, score, bbox, class_ids=class_id)
             track.append_feat(feat)
             self.tracklets[track_id] = track
         else:
-            track.append_det(frame_id, score, bbox)
+            track.append_det(frame_id, score, bbox, class_id)
             track.append_feat(feat)
 
     @property

@@ -11,7 +11,7 @@ from collections import defaultdict
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
-    def __init__(self, tlwh, score, feat=None, feat_history=30):
+    def __init__(self, tlwh, score, feat=None, feat_history=30, class_id=-1):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
@@ -22,6 +22,10 @@ class STrack(BaseTrack):
         self.last_tlwh = self._tlwh
 
         self.score = score
+        # Canonical class id (0=player, 1=goalkeeper, 2=referee, -1=unknown).
+        # On detection STracks this is the detection's class; on tracked STracks
+        # it holds the latest matched detection's class.
+        self.class_id = int(class_id)
         self.tracklet_len = 0
 
         self.smooth_feat = None
@@ -111,6 +115,7 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self.class_id = new_track.class_id
 
     def update(self, new_track, frame_id):
         """
@@ -136,6 +141,7 @@ class STrack(BaseTrack):
         self.is_activated = True
 
         self.score = new_track.score
+        self.class_id = new_track.class_id
 
     @property
     def tlwh(self):
@@ -250,23 +256,27 @@ class Deep_EIoU(object):
             if output_results.shape[1] == 5:
                 scores = output_results[:,4]
                 bboxes = output_results[:, :4]  # x1y1x2y2
+                classes = np.full(len(output_results), -1)  # no class column
             elif output_results.shape[1] == 7:
                 scores = output_results[:, 4] * output_results[:, 5]
                 bboxes = output_results[:, :4]  # x1y1x2y2
+                classes = output_results[:, 6]  # canonical class id
             else:
                 raise ValueError('Wrong detection size {}'.format(output_results.shape[1]))
-                
+
 
             # Remove bad detections
             lowest_inds = scores > self.track_low_thresh
             bboxes = bboxes[lowest_inds]
             scores = scores[lowest_inds]
+            classes = classes[lowest_inds]
 
             # Find high threshold detections
             remain_inds = scores > self.args.track_high_thresh
             dets = bboxes[remain_inds]
             scores_keep = scores[remain_inds]
-            
+            classes_keep = classes[remain_inds]
+
             if self.args.with_reid:
                 embedding = embedding[lowest_inds]
                 features_keep = embedding[remain_inds]
@@ -274,18 +284,20 @@ class Deep_EIoU(object):
         else:
             bboxes = []
             scores = []
+            classes = []
             dets = []
             scores_keep = []
-            features_keep = []      
+            classes_keep = []
+            features_keep = []
 
         if len(dets) > 0:
             '''Detections'''
             if self.args.with_reid:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f) for
-                              (tlbr, s, f) in zip(dets, scores_keep, features_keep)]
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f, class_id=c) for
+                              (tlbr, s, f, c) in zip(dets, scores_keep, features_keep, classes_keep)]
             else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                              (tlbr, s) in zip(dets, scores_keep)]
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, class_id=c) for
+                              (tlbr, s, c) in zip(dets, scores_keep, classes_keep)]
         else:
             detections = []
 
@@ -343,22 +355,24 @@ class Deep_EIoU(object):
             inds_second = np.logical_and(inds_low, inds_high)
             dets_second = bboxes[inds_second]
             scores_second = scores[inds_second]
+            classes_second = classes[inds_second]
             if self.args.with_reid:
                 features_second = embedding[inds_second]
         else:
             dets_second = []
             scores_second = []
+            classes_second = []
             features_second = []
 
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
             if self.args.with_reid:
-                detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f) for
-                                    (tlbr, s, f) in zip(dets_second, scores_second, features_second)]
+                detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f, class_id=c) for
+                                    (tlbr, s, f, c) in zip(dets_second, scores_second, features_second, classes_second)]
             else:
-                detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                                    (tlbr, s) in zip(dets_second, scores_second)]
+                detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, class_id=c) for
+                                    (tlbr, s, c) in zip(dets_second, scores_second, classes_second)]
         else:
             detections_second = []
 

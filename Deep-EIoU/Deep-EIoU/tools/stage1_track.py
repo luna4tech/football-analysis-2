@@ -256,8 +256,9 @@ def track_consume(frame_id, det, embs, tracker, assembler, min_box_area):
         tid = t.track_id
         if tlwh[2] * tlwh[3] > min_box_area:
             # curr_feat is always present on output tracks (current-frame match)
-            # and is already L2-normalized.
-            assembler.add(frame_id, tid, tlwh, t.score, t.curr_feat)
+            # and is already L2-normalized.  class_id is the latest matched
+            # detection's canonical class (-1 when unknown).
+            assembler.add(frame_id, tid, tlwh, t.score, t.curr_feat, t.class_id)
 
 
 # ---------------------------------------------------------------------------
