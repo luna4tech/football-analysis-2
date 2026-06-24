@@ -105,16 +105,18 @@ _NEG = [-1.0, 0.0, 0.0, 0.0]  # cluster B direction (first comp < 0)
 # Confidence-weighted class aggregation
 # ===========================================================================
 def test_aggregate_class_confidence_weighted():
-    # Two frames class 0 (low conf) vs one frame class 1 (high conf): weighted
-    # mode is class 1 even though class 0 has more frames.
-    assert ta.aggregate_class([0, 0, 1], [0.1, 0.1, 0.9]) == 1
+    # Two frames player (low conf) vs one frame goalkeeper (high conf): weighted
+    # mode is the goalkeeper even though player has more frames.
+    P, G = ta.PLAYER_CLASS, ta.GOALKEEPER_CLASS  # 2, 1
+    assert ta.aggregate_class([P, P, G], [0.1, 0.1, 0.9]) == G
 
 
 def test_aggregate_class_unweighted_fallback():
-    # scores absent -> unweighted count: class 0 wins (2 vs 1).
-    assert ta.aggregate_class([0, 0, 1], None) == 0
+    P, G = ta.PLAYER_CLASS, ta.GOALKEEPER_CLASS  # 2, 1
+    # scores absent -> unweighted count: player wins (2 vs 1).
+    assert ta.aggregate_class([P, P, G], None) == P
     # scores too SHORT -> unweighted fallback (never silently down-weight).
-    assert ta.aggregate_class([0, 0, 1], [0.9]) == 0
+    assert ta.aggregate_class([P, P, G], [0.9]) == P
 
 
 def test_aggregate_class_empty_is_unknown():
@@ -122,8 +124,10 @@ def test_aggregate_class_empty_is_unknown():
 
 
 def test_aggregate_class_tie_breaks_lowest_id():
-    # Equal weight on class 1 and class 2 -> lowest id (1) wins deterministically.
-    assert ta.aggregate_class([1, 2], [0.5, 0.5]) == 1
+    # Equal weight on goalkeeper (1) and referee (3) -> lowest id (1) wins
+    # deterministically.
+    G, R = ta.GOALKEEPER_CLASS, ta.REFEREE_CLASS  # 1, 3
+    assert ta.aggregate_class([G, R], [0.5, 0.5]) == G
 
 
 # ===========================================================================
@@ -222,17 +226,18 @@ def test_team_txt_only_col9_changes():
         refined_txt = td / "refined.txt"
         team_txt = td / "team_refined.txt"
         # frame,id,x,y,w,h,score,class,team(-1 placeholder),-1
+        # class_map scheme: player=2, goalkeeper=1.
         rows = [
-            (0, 1, "100.00", "200.00", "30.00", "60.00", 1, 0, -1, -1),
-            (0, 2, "150.00", "250.00", "31.00", "61.00", 1, 0, -1, -1),
-            (1, 1, "101.00", "201.00", "30.00", "60.00", 1, 0, -1, -1),
+            (0, 1, "100.00", "200.00", "30.00", "60.00", 1, 2, -1, -1),
+            (0, 2, "150.00", "250.00", "31.00", "61.00", 1, 2, -1, -1),
+            (1, 1, "101.00", "201.00", "30.00", "60.00", 1, 2, -1, -1),
             (1, 3, "300.00", "400.00", "32.00", "62.00", 1, 1, -1, -1),  # a GK
         ]
         _write_input_refined(refined_txt, rows)
 
         attributes = {
-            1: {"class": 0, "team": 0, "gk": False},
-            2: {"class": 0, "team": 1, "gk": False},
+            1: {"class": 2, "team": 0, "gk": False},
+            2: {"class": 2, "team": 1, "gk": False},
             3: {"class": 1, "team": -1, "gk": True},
         }
         n = ta.write_team_txt(str(refined_txt), str(team_txt), attributes)
@@ -264,10 +269,11 @@ def test_team_txt_only_col9_changes():
 def test_track_attributes_json_schema():
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "track_attributes.json"
+        # class_map scheme: player=2, goalkeeper=1, referee=3.
         attributes = {
-            1: {"class": 0, "team": 0, "gk": False},
+            1: {"class": 2, "team": 0, "gk": False},
             2: {"class": 1, "team": -1, "gk": True},
-            10: {"class": 2, "team": -1, "gk": False},
+            10: {"class": 3, "team": -1, "gk": False},
         }
         ta.write_track_attributes(str(path), attributes)
         data = json.loads(path.read_text(encoding="utf-8"))

@@ -69,10 +69,10 @@ from pipeline.artifacts import ensure_dirs, get_artifact_paths
 from pipeline.cache import should_run
 from pipeline.profiling import profile_stage
 
-# Canonical class ids (convention): 0=player, 1=goalkeeper, 2=referee, -1=unknown.
-PLAYER_CLASS = 0
-GOALKEEPER_CLASS = 1
-REFEREE_CLASS = 2
+# Canonical class ids from the shared repo-root config (single source of truth):
+# goalkeeper=1, player=2, referee=3, -1=unknown.
+from class_map import GOALKEEPER_CLASS, PLAYER_CLASS, REFEREE_CLASS  # noqa: F401
+
 UNKNOWN_TEAM = -1
 
 # Fixed clustering config (k is fixed at 2; deterministic seed / n_init).

@@ -26,11 +26,20 @@ import json
 import logging
 import os
 import os.path as osp
+import sys
 from collections import defaultdict
+from pathlib import Path
+
+# Ensure the repo root is on sys.path so the shared class map imports (this file
+# lives at <repo>/Deep-EIoU/Deep-EIoU/tools/, so the repo root is parents[3]).
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # NOTE: cv2 is imported lazily (inside main / the drawing path) so this module
 # and its pure functions (parse_results, category_color_and_label,
-# load_track_attributes) import — and unit-test — without cv2 installed.
+# load_track_attributes) import — and unit-test — without cv2 installed. The
+# class map is pure (no cv2), so importing it here keeps that property.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,11 +67,15 @@ def load_plot_tracking():
     return plot_tracking
 
 
-# Canonical class ids (must match the detector / Stage-3 output).
-PLAYER_CLASS = 0
-GOALKEEPER_CLASS = 1
-REFEREE_CLASS = 2
-UNKNOWN_CLASS = -1
+# Canonical class ids from the shared repo-root config (single source of truth;
+# must match the detector / Stage-3 output): goalkeeper=1, player=2, referee=3.
+from class_map import (  # noqa: E402 — after sys.path setup above
+    GOALKEEPER_CLASS,
+    PLAYER_CLASS,
+    REFEREE_CLASS,
+    UNKNOWN_CLASS,
+)
+
 UNKNOWN_TEAM = -1
 
 # Category box colors, BGR (OpenCV order). Chosen to be visually distinct and to

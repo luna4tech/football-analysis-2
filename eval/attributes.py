@@ -9,7 +9,7 @@ TrackEval still evaluates an all-person ``gt.txt`` (class forced to ``1`` by
 prediction / GT txt files (and, when present, the Stage-3 ``track_attributes.json``)
 so the semantic ids are never lost to that forced-pedestrian rewrite.
 
-Canonical class ids: ``0=player, 1=goalkeeper, 2=referee``, unknown ``-1``.
+Canonical class ids: ``1=goalkeeper, 2=player, 3=referee``, unknown ``-1``.
 Team ids: ``0`` / ``1`` for the two clusters, unknown / no-team ``-1``.
 
 Design constraints
@@ -38,23 +38,30 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Ensure the repo root is on sys.path so the shared class map imports (this file
+# lives at <repo>/eval/, so the repo root is parents[1]).
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# Canonical class ids + confusion-matrix order from the shared repo-root config
+# (single source of truth): goalkeeper=1, player=2, referee=3, unknown=-1. The
+# CLASS_LABELS/CLASS_NAMES order is the human row/col order (player, gk, ref).
+from class_map import (  # noqa: E402 — after sys.path setup above
+    CLASS_LABELS,
+    CLASS_NAMES,
+    PLAYER_CLASS,
+    UNKNOWN_CLASS as UNKNOWN,
+)
+
 logger = logging.getLogger(__name__)
-
-# Canonical class ids (mirrors pipeline.team_assignment).
-PLAYER_CLASS = 0
-GOALKEEPER_CLASS = 1
-REFEREE_CLASS = 2
-UNKNOWN = -1
-
-# The three semantic classes, in confusion-matrix row/column order.
-CLASS_LABELS: Tuple[int, ...] = (PLAYER_CLASS, GOALKEEPER_CLASS, REFEREE_CLASS)
-CLASS_NAMES: Tuple[str, ...] = ("player", "goalkeeper", "referee")
 
 DEFAULT_IOU_THRESH = 0.5
 

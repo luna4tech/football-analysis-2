@@ -865,15 +865,16 @@ def test_run_evaluation_stub_no_trackeval_imported():
 
 
 def test_format_gt_line_forces_class1_vis1_for_extended_gt():
-    """A canonical GT row carrying semantic class 0 or 2 must still be written
+    """A canonical GT row carrying semantic class 1, 2, or 3 must still be written
     with class=1 and visibility=1, so TrackEval's pedestrian (class==1) eval keeps
     every row and HOTA/MOTA stay all-person."""
     from eval.trackeval_runner import _format_gt_line
 
     # canonical row: frame,id,x,y,w,h,conf,class,visibility
-    player = _format_gt_line([5, 7, 10, 20, 30, 40, 1.0, 0, 0.5])  # class 0
-    referee = _format_gt_line([6, 8, 11, 21, 31, 41, 1.0, 2, 0.9])  # class 2
-    gk = _format_gt_line([7, 9, 12, 22, 32, 42, 1.0, 1, 1.0])  # class 1
+    # class_map scheme: player=2, referee=3, goalkeeper=1.
+    player = _format_gt_line([5, 7, 10, 20, 30, 40, 1.0, 2, 0.5])  # player
+    referee = _format_gt_line([6, 8, 11, 21, 31, 41, 1.0, 3, 0.9])  # referee
+    gk = _format_gt_line([7, 9, 12, 22, 32, 42, 1.0, 1, 1.0])  # goalkeeper
 
     for line, lbl in ((player, "player"), (referee, "referee"), (gk, "gk")):
         cols = line.split(",")
@@ -889,12 +890,13 @@ def test_format_gt_line_forces_class1_vis1_for_extended_gt():
 
 
 def test_extended_gt_materializes_all_class1():
-    """End-to-end: an extended GT (class 0/1/2 via a custom loader) materializes a
+    """End-to-end: an extended GT (class 1/2/3 via a custom loader) materializes a
     gt.txt whose EVERY row is class=1/vis=1 (no rows dropped by TrackEval)."""
+    # class_map scheme: player=2, referee=3, goalkeeper=1.
     extended = np.array(
         [
-            [1, 1, 0, 0, 10, 10, 1, 0, 1],  # player
-            [1, 2, 20, 20, 10, 10, 1, 2, 1],  # referee
+            [1, 1, 0, 0, 10, 10, 1, 2, 1],  # player
+            [1, 2, 20, 20, 10, 10, 1, 3, 1],  # referee
             [2, 3, 40, 40, 10, 10, 1, 1, 1],  # goalkeeper
         ],
         dtype=np.float64,
@@ -912,18 +914,19 @@ def test_extended_gt_materializes_all_class1():
 # ---------------------------------------------------------------------------
 
 # Extended pred: frame,id,x,y,w,h,score,class,team,-1 (0-based frames).
+# class_map scheme: player=2, referee=3, goalkeeper=1 (team col is 0/1/-1).
 _ATTR_PRED = (
-    "0,1,100,100,50,50,0.9,0,0,-1\n"
-    "1,1,101,101,50,50,0.9,0,0,-1\n"
-    "0,2,300,300,40,40,0.8,2,-1,-1\n"
+    "0,1,100,100,50,50,0.9,2,0,-1\n"
+    "1,1,101,101,50,50,0.9,2,0,-1\n"
+    "0,2,300,300,40,40,0.8,3,-1,-1\n"
     "0,3,500,100,45,55,0.7,1,-1,-1\n"  # goalkeeper, no team
 )
 
 # Extended GT: frame,id,x,y,w,h,conf,class,team (1-based frames).
 _ATTR_GT = (
-    "1,10,102,102,50,50,1,0,1\n"
-    "2,10,102,102,50,50,1,0,1\n"
-    "1,20,301,301,40,40,1,2,-1\n"
+    "1,10,102,102,50,50,1,2,1\n"
+    "2,10,102,102,50,50,1,2,1\n"
+    "1,20,301,301,40,40,1,3,-1\n"
     "1,30,502,102,45,55,1,1,-1\n"  # goalkeeper
 )
 
@@ -933,8 +936,8 @@ def test_parse_attr_rows_no_minus1_coercion():
         p = _write(Path(tmp) / "pred.txt", _ATTR_PRED)
         rows = parse_attr_rows(p)
         assert rows.shape == (4, 8), rows.shape
-        # class col (idx 6): 0,0,2,1 ; team col (idx 7): 0,0,-1,-1 (kept verbatim).
-        assert rows[:, 6].tolist() == [0.0, 0.0, 2.0, 1.0]
+        # class col (idx 6): 2,2,3,1 ; team col (idx 7): 0,0,-1,-1 (kept verbatim).
+        assert rows[:, 6].tolist() == [2.0, 2.0, 3.0, 1.0]
         assert rows[:, 7].tolist() == [0.0, 0.0, -1.0, -1.0], "team -1 must NOT coerce"
 
 
@@ -996,14 +999,16 @@ def test_associate_tracks_majority_breaks_split():
 
 
 def test_class_metrics_accuracy_and_confusion():
+    # class_map scheme: player=2, goalkeeper=1, referee=3.
     assoc = {1: 10, 2: 20, 3: 30}
-    pred_cls = {1: 0, 2: 0, 3: 1}  # pred 2 wrong (referee gt -> labelled player)
-    gt_cls = {10: 0, 20: 2, 30: 1}
+    pred_cls = {1: 2, 2: 2, 3: 1}  # pred 2 wrong (referee gt -> labelled player)
+    gt_cls = {10: 2, 20: 3, 30: 1}
     m = class_metrics(assoc, pred_cls, gt_cls)
     assert m["n_evaluated"] == 3
     assert m["n_correct"] == 2, m
     assert abs(m["accuracy"] - 2 / 3) < 1e-9, m
-    # confusion[gt][pred]; gt referee(2) predicted player(0) -> [2][0] == 1.
+    # confusion[gt][pred] in (player, gk, ref) row/col order; gt referee predicted
+    # player -> [2][0] == 1.
     conf = m["confusion"]
     assert conf[0][0] == 1, "player->player"
     assert conf[2][0] == 1, "referee misclassified as player"
@@ -1011,9 +1016,10 @@ def test_class_metrics_accuracy_and_confusion():
 
 
 def test_class_metrics_skips_unknown_gt_class():
+    # class_map scheme: player=2.
     assoc = {1: 10, 2: 20}
-    pred_cls = {1: 0, 2: 0}
-    gt_cls = {10: 0, 20: -1}  # gt 20 unknown -> not scored
+    pred_cls = {1: 2, 2: 2}
+    gt_cls = {10: 2, 20: -1}  # gt 20 unknown -> not scored
     m = class_metrics(assoc, pred_cls, gt_cls)
     assert m["n_evaluated"] == 1, m
     assert m["accuracy"] == 1.0, m
@@ -1025,9 +1031,10 @@ def test_class_metrics_skips_unknown_gt_class():
 
 
 def test_team_metrics_permutation_invariant_players_only():
+    # class_map scheme: player=2, referee=3 (team col stays 0/1/-1).
     assoc = {1: 10, 2: 20, 3: 30, 4: 40}
-    pred_cls = {1: 0, 2: 0, 3: 0, 4: 2}  # 4 is a referee -> excluded
-    gt_cls = {10: 0, 20: 0, 30: 0, 40: 2}
+    pred_cls = {1: 2, 2: 2, 3: 2, 4: 3}  # 4 is a referee -> excluded
+    gt_cls = {10: 2, 20: 2, 30: 2, 40: 3}
     # pred teams are the SWAP of gt teams -> perm-invariant accuracy must be 1.0.
     pred_team = {1: 1, 2: 1, 3: 0, 4: -1}
     gt_team = {10: 0, 20: 0, 30: 1, 40: -1}
@@ -1037,9 +1044,10 @@ def test_team_metrics_permutation_invariant_players_only():
 
 
 def test_team_metrics_excludes_gk_and_referee():
+    # class_map scheme: goalkeeper=1, referee=3 (NO players).
     assoc = {1: 10, 2: 20}
-    pred_cls = {1: 1, 2: 2}  # gk + referee, NO players
-    gt_cls = {10: 1, 20: 2}
+    pred_cls = {1: 1, 2: 3}  # gk + referee, NO players
+    gt_cls = {10: 1, 20: 3}
     pred_team = {1: 0, 2: 1}
     gt_team = {10: 0, 20: 1}
     m = team_metrics(assoc, pred_cls, pred_team, gt_cls, gt_team)
@@ -1053,15 +1061,16 @@ def test_team_metrics_excludes_gk_and_referee():
 
 
 def test_consistency_purity_and_switches():
-    # track 1: classes [0,0,0] pure; track 2: [0,2,0] -> majority 0, 2 switches.
+    # class_map scheme: player=2, referee=3.
+    # track 1: classes [2,2,2] pure; track 2: [2,3,2] -> majority 2, 2 switches.
     rows = np.array(
         [
-            [0, 1, 0, 0, 1, 1, 0, -1],
-            [1, 1, 0, 0, 1, 1, 0, -1],
-            [2, 1, 0, 0, 1, 1, 0, -1],
-            [0, 2, 0, 0, 1, 1, 0, -1],
-            [1, 2, 0, 0, 1, 1, 2, -1],
-            [2, 2, 0, 0, 1, 1, 0, -1],
+            [0, 1, 0, 0, 1, 1, 2, -1],
+            [1, 1, 0, 0, 1, 1, 2, -1],
+            [2, 1, 0, 0, 1, 1, 2, -1],
+            [0, 2, 0, 0, 1, 1, 2, -1],
+            [1, 2, 0, 0, 1, 1, 3, -1],
+            [2, 2, 0, 0, 1, 1, 2, -1],
         ],
         dtype=np.float64,
     )
@@ -1110,12 +1119,13 @@ def test_compute_metrics_no_iou_match_skips_but_keeps_consistency():
 
 
 def test_compute_metrics_pred_no_team_skips_team_only():
+    # class_map scheme: player=2 (cols are frame,id,x,y,w,h,class,team).
     pred = np.array(
-        [[0, 1, 100, 100, 50, 50, 0, -1], [1, 1, 100, 100, 50, 50, 0, -1]],
+        [[0, 1, 100, 100, 50, 50, 2, -1], [1, 1, 100, 100, 50, 50, 2, -1]],
         dtype=np.float64,
-    )  # pred has class 0 but NO team
+    )  # pred has a player class but NO team
     gt = np.array(
-        [[1, 10, 100, 100, 50, 50, 0, 1], [2, 10, 100, 100, 50, 50, 0, 1]],
+        [[1, 10, 100, 100, 50, 50, 2, 1], [2, 10, 100, 100, 50, 50, 2, 1]],
         dtype=np.float64,
     )
     m = compute_attribute_metrics(gt, pred)
@@ -1138,8 +1148,8 @@ def test_ari_nmi_skipped_when_sklearn_absent():
         _sys.modules[name] = None  # type: ignore[assignment]
     try:
         assoc = {1: 10, 2: 20}
-        pred_cls = {1: 0, 2: 0}
-        gt_cls = {10: 0, 20: 0}
+        pred_cls = {1: 2, 2: 2}  # players (class_map: player=2)
+        gt_cls = {10: 2, 20: 2}
         pred_team = {1: 0, 2: 1}
         gt_team = {10: 0, 20: 1}
         m = team_metrics(assoc, pred_cls, pred_team, gt_cls, gt_team)
@@ -1161,8 +1171,9 @@ def test_ari_nmi_skipped_when_sklearn_absent():
 
 def test_aggregate_pred_prefers_track_attributes_json():
     with tempfile.TemporaryDirectory() as tmp:
-        # txt says track 1 class 0/team 0; json (authoritative) says class 1/team 1.
-        pred_txt = "0,1,0,0,10,10,0.9,0,0,-1\n1,1,0,0,10,10,0.9,0,0,-1\n"
+        # txt says track 1 player(2)/team 0; json (authoritative) says
+        # goalkeeper(1)/team 1 (class_map scheme).
+        pred_txt = "0,1,0,0,10,10,0.9,2,0,-1\n1,1,0,0,10,10,0.9,2,0,-1\n"
         rows = parse_attr_rows_str(pred_txt)
         attr_json = _write(
             Path(tmp) / "track_attributes.json",
@@ -1189,10 +1200,11 @@ def test_run_attribute_eval_writes_json_and_uses_sibling_attrs():
     with tempfile.TemporaryDirectory() as tmp:
         team_dir = Path(tmp) / "03_team"
         pred = _write(team_dir / "refined.txt", _ATTR_PRED)
+        # class_map scheme: player=2, referee=3, goalkeeper=1 (matches _ATTR_GT).
         _write(
             team_dir / "track_attributes.json",
-            '{"1": {"class": 0, "team": 0, "gk": false},'
-            ' "2": {"class": 2, "team": -1, "gk": false},'
+            '{"1": {"class": 2, "team": 0, "gk": false},'
+            ' "2": {"class": 3, "team": -1, "gk": false},'
             ' "3": {"class": 1, "team": -1, "gk": true}}',
         )
         gt = _write(Path(tmp) / "gt.txt", _ATTR_GT)
@@ -1297,7 +1309,7 @@ _TESTS = [
     ("E2 run_evaluation: stub runner writes metrics.json", test_run_evaluation_injected_stub_writes_metrics_json),
     ("E2 run_evaluation: stub does not import trackeval", test_run_evaluation_stub_no_trackeval_imported),
     # Task 005 — _format_gt_line forces class=1/vis=1
-    ("005 gt-line: class=1/vis=1 for extended class 0/1/2", test_format_gt_line_forces_class1_vis1_for_extended_gt),
+    ("005 gt-line: class=1/vis=1 for extended class 1/2/3", test_format_gt_line_forces_class1_vis1_for_extended_gt),
     ("005 gt-line: extended GT materializes all class=1", test_extended_gt_materializes_all_class1),
     # Task 005 — attribute raw parser (no -1 coercion)
     ("005 parse: raw attr keeps -1 (no coercion)", test_parse_attr_rows_no_minus1_coercion),

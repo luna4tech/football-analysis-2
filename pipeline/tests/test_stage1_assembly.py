@@ -198,10 +198,11 @@ def test_assembler_class_ids_aligned():
         return v / np.linalg.norm(v)
 
     # (frame_id, track_id, tlwh, score, feat, class_id)
+    # Canonical scheme (class_map): goalkeeper=1, player=2, referee=3.
     records = [
-        (0, 1, [10.0, 20.0, 30.0, 40.0], 0.9, feat(), 0),   # player
-        (0, 2, [50.0, 60.0, 20.0, 50.0], 0.8, feat(), 2),   # referee
-        (1, 1, [11.0, 21.0, 30.0, 40.0], 0.85, feat(), 0),  # player (same)
+        (0, 1, [10.0, 20.0, 30.0, 40.0], 0.9, feat(), 2),   # player
+        (0, 2, [50.0, 60.0, 20.0, 50.0], 0.8, feat(), 3),   # referee
+        (1, 1, [11.0, 21.0, 30.0, 40.0], 0.85, feat(), 2),  # player (same)
         (2, 1, [12.0, 22.0, 30.0, 40.0], 0.7, feat(), 1),   # latest matched -> gk
     ]
     for fid, tid, tlwh, score, ft, cid in records:
@@ -209,8 +210,8 @@ def test_assembler_class_ids_aligned():
 
     t1 = asm.tracklets[1]
     t2 = asm.tracklets[2]
-    assert t1.class_ids == [0, 0, 1], t1.class_ids
-    assert t2.class_ids == [2], t2.class_ids
+    assert t1.class_ids == [2, 2, 1], t1.class_ids
+    assert t2.class_ids == [3], t2.class_ids
     # class_ids aligned 1:1 with the other parallel arrays.
     for tr in (t1, t2):
         n = len(tr.times)
@@ -219,7 +220,7 @@ def test_assembler_class_ids_aligned():
 
     # MOT column 8 carries the canonical class for each row, in order.
     col8 = [line.strip().split(",")[7] for line in asm.results]
-    assert col8 == ["0", "2", "0", "1"], col8
+    assert col8 == ["2", "3", "2", "1"], col8
 
 
 def test_assembler_default_class_is_unknown():
@@ -282,7 +283,7 @@ def test_tracklet_real_legacy_pickle_roundtrip():
     # End-to-end: pickle a Tracklet, strip class_ids from the serialized state,
     # and confirm unpickling backfills an aligned class_ids (no AttributeError).
     Tracklet = load_tracklet_class(_GTA_LINK_DIR)
-    tr = Tracklet(5, [0, 1], [0.9, 0.8], [[1, 2, 3, 4], [5, 6, 7, 8]], class_ids=[0, 2])
+    tr = Tracklet(5, [0, 1], [0.9, 0.8], [[1, 2, 3, 4], [5, 6, 7, 8]], class_ids=[2, 3])
 
     state = tr.__dict__.copy()
     state.pop("class_ids")  # mimic a pre-class_ids on-disk Tracklet
@@ -302,10 +303,10 @@ def test_tracklet_extract_preserves_class_ids():
     Tracklet = load_tracklet_class(_GTA_LINK_DIR)
     feats = [np.ones(4, dtype=np.float32) * i for i in range(4)]
     tr = Tracklet(7, [0, 1, 2, 3], [0.9, 0.8, 0.7, 0.6],
-                  [[1, 2, 3, 4]] * 4, feats=feats, class_ids=[0, 0, 1, 2])
+                  [[1, 2, 3, 4]] * 4, feats=feats, class_ids=[2, 2, 1, 3])
     sub = tr.extract(1, 2)
     assert sub.times == [1, 2], sub.times
-    assert sub.class_ids == [0, 1], sub.class_ids
+    assert sub.class_ids == [2, 1], sub.class_ids
     assert len(sub.class_ids) == len(sub.times)
 
 
@@ -361,7 +362,8 @@ _FOOTBALL_NAMES = {0: "Referee", 1: "Player", 2: "GoalKeeper", 3: "ball"}
 
 
 def test_ultralytics_conversion_rows():
-    # Raw classes 1 (Player) and 2 (GoalKeeper) -> canonical 0 and 1 by name.
+    # Raw classes 1 (Player) and 2 (GoalKeeper) -> canonical 2 and 1 by name
+    # (class_map scheme: goalkeeper=1, player=2, referee=3).
     result = _FakeResult(
         _FakeBoxes(
             np.array([[1, 2, 3, 4], [10, 20, 30, 40]], dtype=np.float32),
@@ -373,7 +375,7 @@ def test_ultralytics_conversion_rows():
     out = ultralytics_result_to_yolox_output(result)
     expected = np.array(
         [
-            [1, 2, 3, 4, 0.9, 1.0, 0],   # Player -> 0
+            [1, 2, 3, 4, 0.9, 1.0, 2],   # Player -> 2
             [10, 20, 30, 40, 0.75, 1.0, 1],  # GoalKeeper -> 1
         ],
         dtype=np.float32,
@@ -384,7 +386,7 @@ def test_ultralytics_conversion_rows():
 
 
 def test_ultralytics_name_remap_canonical_and_unknown():
-    # referee -> 2 (case-insensitive), ball -> -1 (not a tracked category),
+    # referee -> 3 (case-insensitive), ball -> -1 (not a tracked category),
     # and an unknown raw index -> -1.
     result = _FakeResult(
         _FakeBoxes(
@@ -395,7 +397,7 @@ def test_ultralytics_name_remap_canonical_and_unknown():
         names=_FOOTBALL_NAMES,
     )
     out = ultralytics_result_to_yolox_output(result)
-    assert list(out[:, 6]) == [2.0, -1.0, -1.0], out[:, 6]
+    assert list(out[:, 6]) == [3.0, -1.0, -1.0], out[:, 6]
 
 
 def test_ultralytics_no_names_all_unknown():

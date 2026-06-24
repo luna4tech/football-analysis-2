@@ -10,7 +10,7 @@ class Tracklet:
             scores (list or float, optional): Detection scores corresponding to frames. Can be a list of scores or a single score. Defaults to None.
             bboxes (list of lists or list, optional): Bounding boxes corresponding to each frame. Each bounding box is a list of 4 elements. Defaults to None.
             feats (list of np.array, optional): Feature vectors corresponding to frames. Each feature should be a numpy array of shape (512,). Defaults to None.
-            class_ids (list or int, optional): Canonical class id (0=player, 1=goalkeeper, 2=referee, -1=unknown) per frame, aligned 1:1 with frames. Can be a list or a single id. Defaults to None.
+            class_ids (list or int, optional): Canonical class id (1=goalkeeper, 2=player, 3=referee, -1=unknown) per frame, aligned 1:1 with frames. Can be a list or a single id. Defaults to None.
         '''
         self.track_id = track_id
         self.parent_id = track_id

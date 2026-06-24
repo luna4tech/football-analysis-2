@@ -22,7 +22,7 @@ class STrack(BaseTrack):
         self.last_tlwh = self._tlwh
 
         self.score = score
-        # Canonical class id (0=player, 1=goalkeeper, 2=referee, -1=unknown).
+        # Canonical class id (1=goalkeeper, 2=player, 3=referee, -1=unknown).
         # On detection STracks this is the detection's class; on tracked STracks
         # it holds the latest matched detection's class.
         self.class_id = int(class_id)

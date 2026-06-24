@@ -96,10 +96,10 @@ def _format_gt_line(row: "np.ndarray | list") -> str:
     ``frame,id,x,y,w,h,conf,class,visibility``. ``class`` and ``visibility`` are
     written as the CONSTANT pedestrian values ``1`` and ``1`` — NOT taken from the
     canonical row — so that the materialized ``gt.txt`` stays all-person regardless
-    of the semantic ``class_id`` (0/1/2) the extended GT now carries in canonical
+    of the semantic ``class_id`` (1/2/3) the extended GT now carries in canonical
     column 7. TrackEval's MOTChallenge pedestrian eval keeps ONLY ``class==1``
-    rows; writing the semantic class verbatim would drop every player (0) and
-    referee (2) row and silently break HOTA/MOTA. The semantic class/team are
+    rows; writing the semantic class verbatim would drop every player (2) and
+    referee (3) row and silently break HOTA/MOTA. The semantic class/team are
     evaluated separately by :mod:`eval.attributes` straight off the raw txt.
 
     For the current all-``-1`` sample GT this is identical to the previous

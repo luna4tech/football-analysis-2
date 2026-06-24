@@ -29,13 +29,19 @@ from typing import Any, Dict, List, Sequence
 
 import numpy as np
 
+# Ensure the repo root is on sys.path so the shared class map imports (this file
+# lives at <repo>/Deep-EIoU/Deep-EIoU/tools/, so the repo root is parents[3]).
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-# Canonical class IDs (project-wide convention; these three packages run as
-# separate subprocesses with no shared imports, so this is a documented
-# convention kept as local literals, not a shared module).
-#   0 = player, 1 = goalkeeper, 2 = referee, -1 = unknown/legacy.
-CLASS_UNKNOWN = -1
-_NAME_TO_CANONICAL = {"player": 0, "goalkeeper": 1, "referee": 2}
+from class_map import CLASS_NAME_TO_ID, UNKNOWN_CLASS  # noqa: E402 — after sys.path
+
+# Canonical class IDs come from the shared repo-root config (single source of
+# truth): goalkeeper=1, player=2, referee=3, unknown=-1. Resolution is BY NAME
+# (lowercased keys), so only the numeric values are owned by ``class_map``.
+CLASS_UNKNOWN = UNKNOWN_CLASS
+_NAME_TO_CANONICAL = CLASS_NAME_TO_ID
 
 
 def _array_like_to_numpy(value: Any) -> "np.ndarray":
@@ -82,7 +88,7 @@ def ultralytics_result_to_yolox_output(result: Any) -> "np.ndarray | None":
     tracker multiplies ``score * class_conf`` for 7-column rows, so
     ``class_conf`` is fixed at 1.0 to preserve Ultralytics' confidence as the
     effective tracking score.  ``class_id`` is the **canonical** class ID
-    (0=player, 1=goalkeeper, 2=referee, -1=unknown), remapped by name from the
+    (goalkeeper=1, player=2, referee=3, -1=unknown), remapped by name from the
     detector's raw class via the result's ``names`` mapping.
     """
     boxes = getattr(result, "boxes", None)
@@ -231,7 +237,7 @@ class TrackletAssembler:
             ``np.float32`` and NOT re-normalized.
         class_id:
             Canonical class id for this frame's matched detection
-            (0=player, 1=goalkeeper, 2=referee, -1=unknown).  Written to MOT
+            (goalkeeper=1, player=2, referee=3, -1=unknown).  Written to MOT
             column 8 and appended to the Tracklet's per-frame ``class_ids``.
         """
         class_id = int(class_id)

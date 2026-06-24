@@ -105,18 +105,19 @@ def test_parse_results_extended_columns():
     with tempfile.TemporaryDirectory() as td:
         txt = Path(td) / "refined.txt"
         # frame,id,x,y,w,h,score,class_id,team_id,-1
+        # class_map scheme: player=2, goalkeeper=1.
         rows = [
-            (0, 1, "100.00", "200.00", "30.00", "60.00", 1, 0, 0, -1),  # player team0
-            (0, 2, "150.00", "250.00", "31.00", "61.00", 1, 0, 1, -1),  # player team1
+            (0, 1, "100.00", "200.00", "30.00", "60.00", 1, 2, 0, -1),  # player team0
+            (0, 2, "150.00", "250.00", "31.00", "61.00", 1, 2, 1, -1),  # player team1
             (0, 3, "300.00", "400.00", "32.00", "62.00", 1, 1, -1, -1),  # gk
-            (1, 1, "101.00", "201.00", "30.00", "60.00", 1, 0, 0, -1),
+            (1, 1, "101.00", "201.00", "30.00", "60.00", 1, 2, 0, -1),
         ]
         _write_txt(txt, rows)
         frames, n_rows = _rft.parse_results(str(txt))
         assert n_rows == 4, n_rows
         tlwhs, ids, scores, class_ids, team_ids = frames[0]
         assert ids == [1, 2, 3], ids
-        assert class_ids == [0, 0, 1], class_ids
+        assert class_ids == [2, 2, 1], class_ids
         assert team_ids == [0, 1, -1], team_ids
         assert tlwhs[0] == (100.0, 200.0, 30.0, 60.0), tlwhs[0]
         # frame 1 parsed too.
@@ -158,15 +159,16 @@ def test_parse_results_short_rows_default_unknown():
 def test_load_track_attributes_join():
     with tempfile.TemporaryDirectory() as td:
         attr = Path(td) / "track_attributes.json"
+        # class_map scheme: player=2, goalkeeper=1, referee=3.
         attr.write_text(json.dumps({
-            "1": {"class": 0, "team": 0, "gk": False},
-            "2": {"class": 0, "team": 1, "gk": False},
+            "1": {"class": 2, "team": 0, "gk": False},
+            "2": {"class": 2, "team": 1, "gk": False},
             "3": {"class": 1, "team": -1, "gk": True},
-            "10": {"class": 2, "team": -1, "gk": False},
+            "10": {"class": 3, "team": -1, "gk": False},
         }), encoding="utf-8")
         out = _rft.load_track_attributes(str(attr))
         # keys -> int ids; values -> (class, team) tuples.
-        assert out == {1: (0, 0), 2: (0, 1), 3: (1, -1), 10: (2, -1)}, out
+        assert out == {1: (2, 0), 2: (2, 1), 3: (1, -1), 10: (3, -1)}, out
 
 
 def test_load_track_attributes_missing_returns_empty():
@@ -193,28 +195,28 @@ def test_find_attributes_path_sibling_autodetect():
 # category_color_and_label: all five categories
 # ===========================================================================
 def test_category_player_team0():
-    color, label = _rft.category_color_and_label(7, 0, 0)
+    color, label = _rft.category_color_and_label(7, _rft.PLAYER_CLASS, 0)
     assert color == _rft.C_TEAM0, color
     assert label == "7", label
 
 
 def test_category_player_team1():
-    color, label = _rft.category_color_and_label(7, 0, 1)
+    color, label = _rft.category_color_and_label(7, _rft.PLAYER_CLASS, 1)
     assert color == _rft.C_TEAM1, color
     assert label == "7", label
 
 
 def test_category_goalkeeper_prefix():
-    color, label = _rft.category_color_and_label(9, 1, -1)
+    color, label = _rft.category_color_and_label(9, _rft.GOALKEEPER_CLASS, -1)
     assert color == _rft.C_GK, color
     assert label == "gk:9", label  # gk: prefix, bare id otherwise.
     # GK color/prefix regardless of team value.
-    color2, label2 = _rft.category_color_and_label(9, 1, 0)
+    color2, label2 = _rft.category_color_and_label(9, _rft.GOALKEEPER_CLASS, 0)
     assert color2 == _rft.C_GK and label2 == "gk:9"
 
 
 def test_category_referee_no_prefix():
-    color, label = _rft.category_color_and_label(4, 2, -1)
+    color, label = _rft.category_color_and_label(4, _rft.REFEREE_CLASS, -1)
     assert color == _rft.C_REF, color
     assert label == "4", label  # referee: no prefix.
 
@@ -228,7 +230,7 @@ def test_category_legacy_fallback():
 
 def test_category_player_unknown_team_falls_back():
     # player whose team is unknown -> legacy color + bare id (no team color).
-    color, label = _rft.category_color_and_label(21, 0, -1)
+    color, label = _rft.category_color_and_label(21, _rft.PLAYER_CLASS, -1)
     assert color == _rft.legacy_color(21), color
     assert label == "21", label
 
@@ -243,9 +245,9 @@ def test_category_colors_are_distinct():
 # ===========================================================================
 def test_attributes_take_precedence_over_per_frame_cols():
     # Simulate the main() resolution: attrs win over the row's class/team.
-    track_attrs = {1: (1, -1)}  # attributes say id 1 is a goalkeeper
+    track_attrs = {1: (_rft.GOALKEEPER_CLASS, -1)}  # attributes say id 1 is a goalkeeper
     # per-frame txt said player/team0, but the stable attribute wins.
-    tid, cid, team = 1, 0, 0
+    tid, cid, team = 1, _rft.PLAYER_CLASS, 0
     if tid in track_attrs:
         cid, team = track_attrs[tid]
     color, label = _rft.category_color_and_label(tid, cid, team)
