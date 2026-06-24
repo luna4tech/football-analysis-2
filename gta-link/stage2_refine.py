@@ -9,9 +9,10 @@ connect/merge fragmented ones.
 
 Artifact contract
 -----------------
-    <artifacts>/<video_stem>/01_track/tracklets.pkl   (input, from Stage 1)
-    <artifacts>/<video_stem>/02_refine/refined.txt    (output)
-    <artifacts>/<video_stem>/profiles/02_refine.json  (profiling)
+    <artifacts>/<video_stem>/01_track/tracklets.pkl          (input, from Stage 1)
+    <artifacts>/<video_stem>/02_refine/refined.txt           (output)
+    <artifacts>/<video_stem>/02_refine/refined_tracklets.pkl (output, ids match refined.txt)
+    <artifacts>/<video_stem>/profiles/02_refine.json         (profiling)
 
 Run with CWD = ``gta-link`` so that ``import refine_tracklets`` and
 ``import Tracklet`` both resolve to the sibling files in this directory::
@@ -198,9 +199,15 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
         track1 = tracklets[idx2tid[t1]]
         track2 = tracklets[idx2tid[t2]]
         if deps.check_spatial_constraints(track1, track2, max_x_range, max_y_range):
-            # merge track2 -> track1 (times + bboxes only; embedding via means)
+            # merge track2 -> track1 (the merge SEQUENCE/distances come from
+            # `means`, so concatenating these per-frame arrays does not change
+            # the output — it only keeps the merged track's stored arrays
+            # complete + aligned for Stage 3).
             track1.times += track2.times
             track1.bboxes += track2.bboxes
+            track1.features += track2.features
+            track1.scores += track2.scores
+            track1.class_ids += track2.class_ids
             tracklets.pop(idx2tid[t2])
 
             # frame-count-weighted mean of normalized embeddings (exact)
@@ -230,7 +237,42 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
     return tracklets
 
 
-def run_refine(tmp, refined_txt, params, deps, seq_name):
+def _renumber_and_export_pkl(out, refined_pkl):
+    """Export ``out`` as ``{new_id: Tracklet}`` with ids matching refined.txt.
+
+    ``save_results`` renumbers tracks as ``new_id = i + 1`` over
+    ``sorted(out.keys())``; we apply the SAME mapping here and set each
+    Tracklet's ``.track_id`` to its ``new_id`` so the dict key, the attribute,
+    and the ids written to ``refined.txt`` all agree.
+
+    Also asserts the per-frame invariant for every exported track:
+    ``len(times) == len(bboxes) == len(features) == len(scores) == len(class_ids)``.
+    """
+    renumbered = {}
+    for i, tid in enumerate(sorted(out.keys())):
+        track = out[tid]
+        new_id = i + 1
+        track.track_id = new_id
+        n = len(track.times)
+        assert (
+            len(track.bboxes) == n
+            and len(track.features) == n
+            and len(track.scores) == n
+            and len(track.class_ids) == n
+        ), (
+            "exported track {} has misaligned per-frame arrays: "
+            "times={}, bboxes={}, features={}, scores={}, class_ids={}".format(
+                new_id, n, len(track.bboxes), len(track.features),
+                len(track.scores), len(track.class_ids),
+            )
+        )
+        renumbered[new_id] = track
+
+    with open(refined_pkl, "wb") as f:
+        pickle.dump(renumbered, f)
+
+
+def run_refine(tmp, refined_txt, params, deps, seq_name, refined_pkl=None):
     """Refine ONE pkl's tracklets: split, then connect/merge.
 
     Mirrors refine_tracklets.main()'s per-seq body (split THEN connect) for a
@@ -263,6 +305,11 @@ def run_refine(tmp, refined_txt, params, deps, seq_name):
         A :class:`RefineDeps` bundle of the algorithm callables.
     seq_name:
         Sequence name (the video stem); kept for parity / logging.
+    refined_pkl:
+        Optional output path for ``refined_tracklets.pkl``.  When given, the
+        merged tracklets are exported as ``{new_id: Tracklet}`` using the SAME
+        ``i + 1`` renumbering ``save_results`` applies, so the pkl ids match
+        ``refined.txt``.
 
     Returns
     -------
@@ -311,6 +358,10 @@ def run_refine(tmp, refined_txt, params, deps, seq_name):
     n_tracklets_out = len(out)
 
     deps.save_results(refined_txt, out)
+
+    # Export {new_id: Tracklet} with ids matching the just-written refined.txt.
+    if refined_pkl is not None:
+        _renumber_and_export_pkl(out, refined_pkl)
 
     return {
         "n_tracklets_in": n_tracklets_in,
@@ -405,12 +456,17 @@ def main(args) -> None:
 
     tracklets_pkl = paths.tracklets_pkl
     refined_txt = paths.refined_txt
+    refined_pkl = paths.refined_tracklets_pkl
 
-    # --- caching: skip if refined.txt is present + newer than tracklets.pkl ---
-    if not should_run(refined_txt, [tracklets_pkl], force=args.force):
+    # --- caching: skip only if BOTH outputs are present + up-to-date ---
+    # refined_tracklets.pkl is a required output too (Stage 3 reads it), so a
+    # missing pkl forces a re-run even when refined.txt is fresh.
+    if not should_run(refined_txt, [tracklets_pkl], force=args.force) and osp.isfile(
+        refined_pkl
+    ):
         print(
-            "Stage 2 cached (refined.txt newer than tracklets.pkl); skipping. "
-            "Use --force to recompute. Output: {}".format(refined_txt)
+            "Stage 2 cached (refined.txt + refined_tracklets.pkl up-to-date); "
+            "skipping. Use --force to recompute. Output: {}".format(refined_txt)
         )
         return
 
@@ -457,7 +513,9 @@ def main(args) -> None:
     }
 
     with profile_stage("02_refine", paths, extra=io_counts):
-        counts = run_refine(tmp, str(refined_txt), params, deps, seq_name)
+        counts = run_refine(
+            tmp, str(refined_txt), params, deps, seq_name, refined_pkl=str(refined_pkl)
+        )
         io_counts.update(counts)
         # n_output_rows: total MOT rows written (sum of tracklet lengths in
         # `out`).  After run_refine, `tmp`/split were mutated in place; the

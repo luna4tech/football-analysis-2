@@ -8,7 +8,8 @@ artifacts/<video_stem>/
     tracks.txt          MOT-format tracking output (0-based frames)
     tracklets.pkl       {id: Tracklet} dict with reused ReID features
   02_refine/
-    refined.txt         refined MOT output
+    refined.txt              refined MOT output
+    refined_tracklets.pkl    {id: Tracklet} dict (ids match refined.txt)
   profiles/
     <stage_name>.json   per-stage profiling data
     summary.json        aggregated summary across all stages
@@ -45,6 +46,8 @@ class ArtifactPaths:
         ``root/02_refine/``
     refined_txt : Path
         ``root/02_refine/refined.txt``
+    refined_tracklets_pkl : Path
+        ``root/02_refine/refined_tracklets.pkl``
     profiles_dir : Path
         ``root/profiles/``
     """
@@ -56,6 +59,7 @@ class ArtifactPaths:
         self.tracklets_pkl: Path = self.track_dir / "tracklets.pkl"
         self.refine_dir: Path = root / "02_refine"
         self.refined_txt: Path = self.refine_dir / "refined.txt"
+        self.refined_tracklets_pkl: Path = self.refine_dir / "refined_tracklets.pkl"
         self.profiles_dir: Path = root / "profiles"
 
     def profile_json(self, stage_name: str) -> Path:

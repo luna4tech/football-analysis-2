@@ -89,7 +89,7 @@ def run_test(name: str, fn) -> None:
 # Minimal Tracklet stand-in for _fast_connect (numpy-only)
 # ---------------------------------------------------------------------------
 class _FakeTrack:
-    def __init__(self, track_id, times, feats, bboxes=None):
+    def __init__(self, track_id, times, feats, bboxes=None, class_ids=None):
         self.track_id = track_id
         self.parent_id = track_id
         self.times = list(times)
@@ -99,6 +99,8 @@ class _FakeTrack:
             else [[0.0, 0.0, 1.0, 1.0] for _ in times]
         )
         self.scores = [1.0 for _ in times]
+        # per-frame class ids, aligned 1:1 with times (default unknown -1).
+        self.class_ids = list(class_ids) if class_ids is not None else [-1 for _ in times]
 
 
 _V0 = [1.0, 0.0, 0.0, 0.0]   # one unit direction
@@ -242,8 +244,8 @@ def _fast_deps(spatial_ok=True):
 def test_fast_merges_identical_nonoverlapping():
     # Two non-overlapping tracklets with identical feats -> distance ~0 -> merge.
     trks = {
-        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
-        2: _FakeTrack(2, range(10, 15), [_V0] * 5),
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5, class_ids=[0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V0] * 5, class_ids=[1] * 5),
     }
     out = _s2._fast_connect(trks, _fast_deps(spatial_ok=True),
                             max_x_range=1e9, max_y_range=1e9, merge_dist_thres=0.4)
@@ -252,6 +254,18 @@ def test_fast_merges_identical_nonoverlapping():
     # merged track keeps t1's id (smaller index) and concatenates times/bboxes.
     assert sorted(survivor.times) == [0, 1, 2, 3, 4, 10, 11, 12, 13, 14], survivor.times
     assert len(survivor.bboxes) == 10, len(survivor.bboxes)
+    # merge must concatenate features/scores/class_ids too, keeping ALL five
+    # per-frame arrays aligned (Task 002 invariant).
+    n = len(survivor.times)
+    assert (
+        len(survivor.bboxes) == n
+        and len(survivor.features) == n
+        and len(survivor.scores) == n
+        and len(survivor.class_ids) == n
+    ), (n, len(survivor.bboxes), len(survivor.features),
+        len(survivor.scores), len(survivor.class_ids))
+    # class_ids are concatenated in merge order (track1 then track2).
+    assert survivor.class_ids == [0] * 5 + [1] * 5, survivor.class_ids
 
 
 def test_fast_keeps_orthogonal_apart():
@@ -302,6 +316,90 @@ def test_fast_chain_merges_only_similar():
 
 
 # ===========================================================================
+# Refined-tracklets pkl export (_renumber_and_export_pkl) — CPU-only
+# ===========================================================================
+def test_export_pkl_keys_match_save_results_renumbering():
+    # Arbitrary (non-1..n) keys -> exported keys must be i+1 over sorted(keys),
+    # which is EXACTLY the id renumbering save_results writes to refined.txt.
+    out = {
+        7: _FakeTrack(7, range(0, 3), [_V0] * 3),
+        2: _FakeTrack(2, range(10, 13), [_V0] * 3),
+        5: _FakeTrack(5, range(20, 23), [_V0] * 3),
+    }
+    with tempfile.TemporaryDirectory() as td:
+        pkl_path = str(Path(td) / "refined_tracklets.pkl")
+        _s2._renumber_and_export_pkl(out, pkl_path)
+        import pickle as _pickle
+        with open(pkl_path, "rb") as f:
+            loaded = _pickle.load(f)
+
+    # sorted(keys) = [2, 5, 7] -> new ids 1, 2, 3 (same as save_results' i+1).
+    assert sorted(loaded.keys()) == [1, 2, 3], loaded.keys()
+    # dict key and Tracklet.track_id agree (both equal the refined.txt id).
+    for new_id, track in loaded.items():
+        assert track.track_id == new_id, (new_id, track.track_id)
+
+
+def test_export_pkl_track_id_set_on_objects():
+    out = {3: _FakeTrack(3, range(0, 2), [_V0] * 2), 1: _FakeTrack(1, range(5, 7), [_V0] * 2)}
+    with tempfile.TemporaryDirectory() as td:
+        pkl_path = str(Path(td) / "refined_tracklets.pkl")
+        _s2._renumber_and_export_pkl(out, pkl_path)
+    # original tid 1 -> new id 1, original tid 3 -> new id 2 (sorted + i+1).
+    assert out[1].track_id == 1, out[1].track_id
+    assert out[3].track_id == 2, out[3].track_id
+
+
+def test_export_pkl_asserts_array_alignment():
+    bad = _FakeTrack(1, range(0, 5), [_V0] * 5)
+    bad.class_ids = [0, 0]  # deliberately misaligned -> export must reject it
+    raised = False
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _s2._renumber_and_export_pkl({1: bad}, str(Path(td) / "x.pkl"))
+    except AssertionError:
+        raised = True
+    assert raised, "misaligned per-frame arrays must trip the invariant assertion"
+
+
+def test_run_refine_writes_pkl_with_matching_ids():
+    # End-to-end through run_refine: the exported pkl keys must equal the set of
+    # ids save_results would write to refined.txt (i+1 over sorted merged keys).
+    split_out = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5, class_ids=[0] * 5),
+        2: _FakeTrack(2, range(10, 15), [_V1] * 5, class_ids=[2] * 5),  # orthogonal: no merge
+    }
+    rec = _Recorder(split_output=split_out, spatial_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        pkl_path = str(Path(td) / "refined_tracklets.pkl")
+        run_refine(
+            {1: object(), 2: object()}, _REFINED_TXT, _params(),
+            _deps_from(rec), seq_name="clip", refined_pkl=pkl_path,
+        )
+        import pickle as _pickle
+        with open(pkl_path, "rb") as f:
+            loaded = _pickle.load(f)
+    # two un-merged tracks -> ids {1, 2}; every track keeps all 5 arrays aligned.
+    assert sorted(loaded.keys()) == [1, 2], loaded.keys()
+    for new_id, track in loaded.items():
+        n = len(track.times)
+        assert (
+            len(track.bboxes) == n
+            and len(track.features) == n
+            and len(track.scores) == n
+            and len(track.class_ids) == n
+        ), (new_id, n)
+
+
+def test_run_refine_no_pkl_when_path_omitted():
+    # Backward-compat: omitting refined_pkl must not attempt any pkl export.
+    split_out = {1: _FakeTrack(1, range(0, 5), [_V0] * 5)}
+    rec = _Recorder(split_output=split_out)
+    counts = run_refine({1: object()}, _REFINED_TXT, _params(), _deps_from(rec), seq_name="clip")
+    assert counts["n_tracklets_out"] == 1, counts  # ran fine without a pkl path
+
+
+# ===========================================================================
 # Optional real end-to-end refine (SKIPS gracefully when heavy deps missing)
 # ===========================================================================
 def _heavy_deps_available() -> bool:
@@ -327,18 +425,23 @@ def test_optional_end_to_end_real_refine():
     rng = np.random.default_rng(0)
     # Two short, temporally non-overlapping tracklets with near-identical feats
     # so the merge step has a candidate.  Lengths < min_len so split is a no-op.
-    def _mk(tid, frames):
+    # Distinct per-frame class ids so we can check they reach MOT col 8.
+    def _mk(tid, frames, class_id):
         feats = [rng.standard_normal(512).astype(np.float32) for _ in frames]
         scores = [1.0 for _ in frames]
         bboxes = [[100.0 + f, 100.0 + f, 30.0, 60.0] for f in frames]
-        return Tracklet(tid, list(frames), scores, bboxes, feats=feats)
+        class_ids = [class_id for _ in frames]
+        return Tracklet(tid, list(frames), scores, bboxes, feats=feats, class_ids=class_ids)
 
-    tmp = {1: _mk(1, range(0, 10)), 2: _mk(2, range(20, 30))}
+    tmp = {1: _mk(1, range(0, 10), 0), 2: _mk(2, range(20, 30), 2)}
 
     deps = _s2._build_deps()
     with tempfile.TemporaryDirectory() as td:
         out_path = str(Path(td) / "refined.txt")
-        counts = run_refine(tmp, out_path, _params(), deps, seq_name="synthetic")
+        pkl_path = str(Path(td) / "refined_tracklets.pkl")
+        counts = run_refine(
+            tmp, out_path, _params(), deps, seq_name="synthetic", refined_pkl=pkl_path
+        )
         assert Path(out_path).is_file(), "refined.txt must be written"
         rows = Path(out_path).read_text().strip().splitlines()
         assert len(rows) >= 1, "refined.txt should have at least one MOT row"
@@ -346,7 +449,79 @@ def test_optional_end_to_end_real_refine():
         first = rows[0].split(",")
         assert len(first) == 10, first
         assert counts["n_tracklets_in"] == 2, counts
+
+        # --- col 8 carries the per-frame class (0 or 2 here), never the old -1 ---
+        txt_ids = set()
+        for row in rows:
+            cols = row.split(",")
+            txt_ids.add(int(cols[1]))
+            assert cols[7] in ("0", "2"), "col 8 must be the per-frame class: " + row
+
+        # --- pkl exists, keys == the ids written to refined.txt ---
+        import pickle as _pickle
+        with open(pkl_path, "rb") as f:
+            refined_tracklets = _pickle.load(f)
+        assert set(refined_tracklets.keys()) == txt_ids, (
+            sorted(refined_tracklets.keys()), sorted(txt_ids)
+        )
+        # every exported track keeps all five parallel arrays aligned.
+        for new_id, track in refined_tracklets.items():
+            assert track.track_id == new_id, (new_id, track.track_id)
+            n = len(track.times)
+            assert (
+                len(track.bboxes) == n
+                and len(track.features) == n
+                and len(track.scores) == n
+                and len(track.class_ids) == n
+            ), (new_id, n)
     print("    real refine wrote {} rows".format(len(rows)))
+
+
+def test_optional_split_preserves_class_ids():
+    """Real split_tracklets must keep per-frame class_ids aligned (skips w/o deps).
+
+    Builds ONE long tracklet whose features form two well-separated clusters so
+    DBSCAN splits it; the two halves carry distinct class ids.  After the split,
+    each emitted sub-tracklet must have class_ids aligned with its frames and
+    drawn from the correct half (no class loss on split).
+    """
+    if not _heavy_deps_available():
+        print("    SKIP (heavy deps unavailable: refine_tracklets cannot import)")
+        return
+
+    if str(_GTA_LINK_DIR) not in sys.path:
+        sys.path.insert(0, str(_GTA_LINK_DIR))
+    import refine_tracklets  # noqa: WPS433
+    from Tracklet import Tracklet  # noqa: WPS433
+
+    rng = np.random.default_rng(1)
+    # Two tight, far-apart feature clusters -> a clear id-switch to split on.
+    half = 80
+    centerA = np.zeros(512, dtype=np.float32); centerA[0] = 50.0
+    centerB = np.zeros(512, dtype=np.float32); centerB[1] = 50.0
+    feats = (
+        [centerA + 0.01 * rng.standard_normal(512).astype(np.float32) for _ in range(half)]
+        + [centerB + 0.01 * rng.standard_normal(512).astype(np.float32) for _ in range(half)]
+    )
+    frames = list(range(2 * half))
+    scores = [1.0] * (2 * half)
+    bboxes = [[float(f), float(f), 30.0, 60.0] for f in frames]
+    class_ids = [0] * half + [2] * half  # class differs per cluster
+    trk = Tracklet(1, frames, scores, bboxes, feats=feats, class_ids=class_ids)
+
+    out = refine_tracklets.split_tracklets(
+        {1: trk}, eps=0.6, max_k=3, min_samples=10, len_thres=50
+    )
+    assert len(out) >= 2, "the synthetic id-switch tracklet should split"
+    for sub in out.values():
+        n = len(sub.times)
+        # class_ids exist, aligned 1:1 with the sub-tracklet's frames.
+        assert len(sub.class_ids) == n, (n, len(sub.class_ids))
+        assert len(sub.scores) == n and len(sub.bboxes) == n and len(sub.features) == n
+        # within a sub-tracklet the class must be the one tied to its frames
+        # (frame f < half -> class 0, else class 2): no cross-contamination.
+        for f, c in zip(sub.times, sub.class_ids):
+            assert c == (0 if f < half else 2), (f, c)
 
 
 _TESTS = [
@@ -359,7 +534,13 @@ _TESTS = [
     ("fast_connect: temporal overlap blocks merge", test_fast_overlap_blocks_merge),
     ("fast_connect: spatial-gate veto blocks merge", test_fast_spatial_gate_blocks_merge),
     ("fast_connect: chain merges only the similar pair", test_fast_chain_merges_only_similar),
+    ("export_pkl: keys match save_results i+1 renumbering", test_export_pkl_keys_match_save_results_renumbering),
+    ("export_pkl: track_id set on exported objects", test_export_pkl_track_id_set_on_objects),
+    ("export_pkl: misaligned arrays trip the invariant assertion", test_export_pkl_asserts_array_alignment),
+    ("run_refine: writes pkl with ids matching refined.txt", test_run_refine_writes_pkl_with_matching_ids),
+    ("run_refine: no pkl export when path omitted", test_run_refine_no_pkl_when_path_omitted),
     ("run_refine: optional real end-to-end refine (skips w/o deps)", test_optional_end_to_end_real_refine),
+    ("split: optional real split preserves class_ids (skips w/o deps)", test_optional_split_preserves_class_ids),
 ]
 
 

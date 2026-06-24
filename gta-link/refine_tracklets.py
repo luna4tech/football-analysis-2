@@ -326,6 +326,8 @@ def merge_tracklets(tracklets, seq2Dist, Dist, seq_name=None, max_x_range=None, 
             track1.features += track2.features      # Note: currently we merge track 2 to track 1 without creating a new track
             track1.times += track2.times
             track1.bboxes += track2.bboxes
+            track1.scores += track2.scores          # keep per-frame parallel arrays aligned
+            track1.class_ids += track2.class_ids    # carry per-frame class through the merge
             
             # update tracklets dictionary
             tracklets[idx2tid[track1_idx]] = track1
@@ -442,6 +444,7 @@ def split_tracklets(tmp_trklets, eps=None, max_k=None, min_samples=None, len_thr
             frames = np.array(trklet.times)
             bboxes = np.stack(trklet.bboxes)
             scores = np.array(trklet.scores)
+            class_ids = np.array(trklet.class_ids)
             # Perform DBSCAN clustering
             id_switch_detected, clusters = detect_id_switch(embs, eps=eps, min_samples=min_samples, max_clusters=max_k)
             if not id_switch_detected:
@@ -456,9 +459,10 @@ def split_tracklets(tmp_trklets, eps=None, max_k=None, min_samples=None, len_thr
                     tmp_frames = frames[clusters == label]
                     tmp_bboxes = bboxes[clusters == label]
                     tmp_scores = scores[clusters == label]
+                    tmp_class_ids = class_ids[clusters == label]
                     assert new_id not in tmp_trklets
-                    
-                    tracklets[new_id] = Tracklet(new_id, tmp_frames.tolist(), tmp_scores.tolist(), tmp_bboxes.tolist(), feats=tmp_embs.tolist())
+
+                    tracklets[new_id] = Tracklet(new_id, tmp_frames.tolist(), tmp_scores.tolist(), tmp_bboxes.tolist(), feats=tmp_embs.tolist(), class_ids=tmp_class_ids.tolist())
                     new_id += 1
 
     assert len(tracklets) >= len(tmp_trklets)
@@ -479,11 +483,16 @@ def save_results(sct_output_path, tracklets):
     for i, tid in enumerate(sorted(tracklets.keys())): # add each track to results
         track = tracklets[tid]
         tid = i + 1
+        class_ids = getattr(track, 'class_ids', None)
+        if class_ids is None:
+            class_ids = []
         for instance_idx, frame_id in enumerate(track.times):
             bbox = track.bboxes[instance_idx]
-            
+            # per-frame canonical class in MOT col 8 (fallback -1 if absent/short)
+            class_id = class_ids[instance_idx] if instance_idx < len(class_ids) else -1
+
             results.append(
-                [frame_id, tid, bbox[0], bbox[1], bbox[2], bbox[3], 1, -1, -1, -1]
+                [frame_id, tid, bbox[0], bbox[1], bbox[2], bbox[3], 1, class_id, -1, -1]
             )
     results = sorted(results, key=lambda x: x[0])
     txt_results = []
