@@ -198,8 +198,8 @@ def make_parser():
     parser.add_argument(
         "--line_thickness",
         type=int,
-        default=1,
-        help="bounding-box line thickness in px (default: 1; demo.py uses 3)",
+        default=2,
+        help="bounding-box line thickness in px (default: 2; demo.py uses 3)",
     )
     parser.add_argument(
         "--text_scale",
@@ -210,8 +210,8 @@ def make_parser():
     parser.add_argument(
         "--text_thickness",
         type=int,
-        default=1,
-        help="id-label font thickness (default: 1; demo.py uses 2)",
+        default=2,
+        help="id-label font thickness (default: 2; demo.py uses 2)",
     )
     return parser
 
