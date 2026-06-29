@@ -97,8 +97,14 @@ Full list: `python -m pipeline run --help`. Exhaustive reference in §B4.
 ## A4. Azure storage to download and upload artifacts
 
 Pull inputs and checkpoints from Blob, run on local VM, then push the outputs back.
+The repo ships `azure_blob.py` (repo root) for this — a tiny helper that needs only
+the connection string (no `az login`). Install its one dependency on the VM:
 
-Authenticate once via connection string (`az storage blob` honors it):
+```bash
+pip install azure-storage-blob
+```
+
+Authenticate once via connection string (`azure_blob.py` reads this env var):
 
 ```bash
 export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
@@ -108,15 +114,17 @@ Then pull → run → push:
 
 ```bash
 # Pull the clip and the checkpoints from Blob
-az storage blob download       --container-name videos -n clip.mp4 -f ./clip.mp4
-az storage blob download-batch  -s checkpoints -d Deep-EIoU/Deep-EIoU/checkpoints
+python azure_blob.py download     videos clip.mp4 ./clip.mp4
+python azure_blob.py download-dir  checkpoints "" Deep-EIoU/Deep-EIoU/checkpoints
 
 # Run on local disk
-python -m pipeline run --video ./clip.mp4 --artifacts-dir ./out --fp16 --fuse
+python -m pipeline run --video ./clip.mp4 --artifacts-dir ./out --device gpu --fp16 --fuse
 
 # Push the artifact tree back to Blob
-az storage blob upload-batch    -d outputs/clip -s ./out/clip
+python azure_blob.py upload-dir    outputs <stem> ./out/<stem>
 ```
+
+`az storage blob` / `azcopy` (via SAS, for very large transfers) remain alternatives.
 
 
 # Part B — Reference
