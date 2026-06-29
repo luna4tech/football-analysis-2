@@ -105,6 +105,8 @@ def test_stage1_command():
     assert _value_after(cmd, "--artifacts-dir") == "/abs/artifacts", cmd
     assert _value_after(cmd, "--device") == "gpu", cmd
     assert _value_after(cmd, "--detector-ckpt") == "checkpoints/yolov11l.pt", cmd
+    # --batch-size is always passed; default equals the stage default (16).
+    assert _value_after(cmd, "--batch-size") == "16", cmd
     # default: not forced.
     assert "--force" not in cmd, cmd
 
@@ -118,6 +120,12 @@ def test_stage1_force_adds_force():
     opts = RunOptions(force_stage1=True)
     cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
     assert "--force" in cmd, cmd
+
+
+def test_stage1_batch_size_forwarded():
+    opts = RunOptions(batch_size=8)
+    cmd = build_stage1_command("/abs/clip.mp4", "/abs/artifacts", opts)
+    assert _value_after(cmd, "--batch-size") == "8", cmd
 
 
 def test_stage1_fp16_and_fuse_off_by_default():
@@ -343,6 +351,7 @@ _TESTS = [
     ("stage1 command shape", test_stage1_command),
     ("stage1 --device forwarded", test_stage1_device_forwarded),
     ("stage1 force adds --force", test_stage1_force_adds_force),
+    ("stage1 --batch-size forwarded", test_stage1_batch_size_forwarded),
     ("stage1 --fp16/--fuse off by default", test_stage1_fp16_and_fuse_off_by_default),
     ("stage1 --fp16/--fuse forwarded", test_stage1_fp16_and_fuse_forwarded),
     ("stage2 refine params forwarded", test_stage2_refine_params_forwarded),

@@ -78,6 +78,10 @@ class RunOptions:
         main GPU throughput lever; FP16 typically gives ~1.5-2x.
     fuse : bool
         Fuse detector conv+BN layers (forwarded as ``--fuse``); small free gain.
+    batch_size : int
+        Perception batch window (forwarded as ``--batch-size``): frames detected
+        + ReID'd per batch before the tracker replays them frame-by-frame.
+        Tracking stays sequential; only detection/ReID are batched.
 
     Stage 2 refine params (forwarded with the same names Stage 2 declares)
     ---------------------------------------------------------------------
@@ -104,6 +108,7 @@ class RunOptions:
         detector_ckpt: "Optional[str]" = None,
         fp16: bool = False,
         fuse: bool = False,
+        batch_size: int = 16,
         eps: float = 0.6,
         min_samples: int = 10,
         max_k: int = 3,
@@ -121,6 +126,7 @@ class RunOptions:
         self.detector_ckpt = detector_ckpt
         self.fp16 = fp16
         self.fuse = fuse
+        self.batch_size = batch_size
         self.eps = eps
         self.min_samples = min_samples
         self.max_k = max_k
@@ -164,8 +170,8 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
     """Build the Stage-1 argv (to run with ``cwd=STAGE1_CWD``).
 
     Always passes the absolute ``--video`` / ``--artifacts-dir``, ``--device``,
-    and ``--detector-ckpt``.  Forwards ``--fp16`` / ``--fuse`` only when enabled,
-    and ``--force`` only when Stage 1 is forced.
+    ``--detector-ckpt``, and ``--batch-size``.  Forwards ``--fp16`` / ``--fuse``
+    only when enabled, and ``--force`` only when Stage 1 is forced.
     """
     cmd: List[str] = [
         sys.executable,
@@ -174,6 +180,7 @@ def build_stage1_command(video_abs: str, artifacts_abs: str, opts: RunOptions) -
         "--artifacts-dir", artifacts_abs,
         "--device", opts.device,
         "--detector-ckpt", opts.detector_ckpt,
+        "--batch-size", str(opts.batch_size),
     ]
     if opts.fp16:
         cmd += ["--fp16"]

@@ -235,6 +235,7 @@ To force a single direct stage: pass `--force` to that stage script.
 | `--detector-ckpt PATH` | `checkpoints/yolov11l.pt` | Stage 1 YOLOv11 checkpoint. |
 | `--fp16` | off | Half-precision detector inference (main throughput lever). |
 | `--fuse` | off | Fuse detector conv+BN (small free gain). |
+| `--batch-size INT` | `16` | Stage 1 perception batch window — frames to detect + ReID per batch before replaying the tracker frame-by-frame. Tracking stays sequential; only detection/ReID are batched. Lower it if a high-res batch overflows VRAM. |
 | `--eps FLOAT` | `0.6` | Stage 2 DBSCAN eps (split). |
 | `--min_samples INT` | `10` | Stage 2 DBSCAN min_samples. |
 | `--max_k INT` | `3` | Stage 2 max subtracklets per split. |
@@ -253,7 +254,6 @@ These exist only on the individual stage scripts; the orchestrator always uses t
 
 | Flag | Stage script | Default | Meaning |
 |---|---|---|---|
-| `--batch-size INT` | `tools/stage1_track.py` | `16` | Perception batch window — frames to detect + ReID per batch before replaying the tracker frame-by-frame. Tracking stays sequential; only detection/ReID are batched. Lower it if a high-res batch overflows VRAM. |
 | `--keep-features` | `stage2_refine.py` | off | Export the **full** `refined_tracklets.pkl` (per-detection features / times / bboxes intact). The default is a slim pkl — a per-track mean embedding + scores + class_ids only (Stage 3, the sole consumer, reads just those), which drops the ~4 GB of features. |
 
 Stage 1 also inherits DeepEIoU's `demo.py` tracker/detector knobs (`--conf`, `--nms`,
@@ -372,8 +372,9 @@ packages (`tb-nightly`, `flake8`, `yapf`) the pipeline doesn't use — harmless,
 **Troubleshooting.**
 - **`ModuleNotFoundError: No module named 'torchreid.utils'`** — you installed PyPI
   `torchreid`. Uninstall it and `pip install -e Deep-EIoU/Deep-EIoU/reid` instead (§A1).
-- **GPU out of memory** — add `--fp16` (roughly halves activation memory); run a direct
-  Stage 1 with a smaller `--batch-size` (§B4); or process shorter clips.
+- **GPU out of memory** — add `--fp16` (roughly halves activation memory); lower
+  `--batch-size` — now passable straight to `python -m pipeline run --batch-size N`
+  (§B4); or process shorter clips.
 - **`FileNotFoundError` for a checkpoint** — `yolov11l.pt` and `sports_model.pth.tar-60`
   must sit in `Deep-EIoU/Deep-EIoU/checkpoints/` under those exact names (§A1).
 - **Writing artifacts is slow / flaky on long videos** (`tracklets.pkl` can be hundreds

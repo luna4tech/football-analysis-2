@@ -87,6 +87,15 @@ def _add_run_parser(subparsers: "argparse._SubParsersAction") -> None:
         default=False,
         help="fuse conv+BN in the detector (small free speedup)",
     )
+    g1.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=16,
+        help="perception batch window: frames to detect + ReID per batch before "
+        "the tracker replays them frame-by-frame. Tracking stays sequential; only "
+        "detection/ReID are batched. Lower it if a high-res batch overflows VRAM.",
+    )
 
     # --- Stage 2 ---
     g2 = p.add_argument_group("Stage 2 (refine)")
@@ -140,6 +149,7 @@ def _run_from_args(args: argparse.Namespace) -> int:
         detector_ckpt=args.detector_ckpt,
         fp16=args.fp16,
         fuse=args.fuse,
+        batch_size=args.batch_size,
         eps=args.eps,
         min_samples=args.min_samples,
         max_k=args.max_k,
