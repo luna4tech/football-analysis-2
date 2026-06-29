@@ -9,19 +9,6 @@ clip.mp4 ─▶ Stage 1 (DeepEIoU)         ─▶ Stage 2 (GtaLink)      ─▶ 
             tracks.txt + tracklets.pkl ───▶ refined.txt + .pkl ───▶ refined.txt + attrs
 ```
 
-This guide has two parts:
-
-- **Part A — Quickstart**: prerequisites, from-scratch setup, the minimal run, key
-  options, and running on a fresh GPU VM (e.g. Azure).
-- **Part B — Reference**: architecture, the artifact contract, per-stage runs, the
-  exhaustive option set, caching, profiling, `--fp16`, output verification, and
-  troubleshooting.
-
-For an end-to-end Google Colab runbook (Drive-mounted, copy-paste cells), use
-[`run_pipeline_colab.ipynb`](run_pipeline_colab.ipynb). It is the canonical Colab
-path; this guide is environment-agnostic.
-
----
 
 # Part A — Quickstart
 
@@ -75,7 +62,7 @@ All commands below assume your shell's CWD is the **repo root**.
 ## A2. Minimal end-to-end run
 
 ```bash
-python -m pipeline run --video clip.mp4 --artifacts-dir ./out --device gpu --fp16 --fuse
+python -m pipeline run --video clip.mp4 --artifacts-dir ./out --fp16 --fuse
 ```
 
 This chains Stage 1 (tracking) → Stage 2 (refine) → Stage 3 (team assignment),
@@ -96,11 +83,9 @@ clip lands under `./out/<video_stem>/` (full layout in §B2); the final result i
 
 Full list: `python -m pipeline run --help`. Exhaustive reference in §B4.
 
-## A4. Run on a fresh GPU VM (e.g. Azure)
+## A4. Azure storage to download and upload artifacts
 
-`python -m pipeline run` is environment-agnostic — no bespoke script needed. The only
-Azure-specific step is moving files to/from Blob Storage with the `az` CLI. Pull inputs
-and checkpoints from Blob, run on **fast local VM disk**, then push the outputs back.
+Pull inputs and checkpoints from Blob, run on local VM, then push the outputs back.
 
 Authenticate once via connection string (`az storage blob` honors it):
 
@@ -116,18 +101,12 @@ az storage blob download       --container-name videos -n clip.mp4 -f ./clip.mp4
 az storage blob download-batch  -s checkpoints -d Deep-EIoU/Deep-EIoU/checkpoints
 
 # Run on local disk
-python -m pipeline run --video ./clip.mp4 --artifacts-dir ./out --device gpu --fp16 --fuse
+python -m pipeline run --video ./clip.mp4 --artifacts-dir ./out --fp16 --fuse
 
 # Push the artifact tree back to Blob
 az storage blob upload-batch    -d outputs/clip -s ./out/clip
 ```
 
-Notes:
-- Artifacts go to fast local disk during the run, then sync to Blob — this matches the
-  I/O design (the `tracklets.pkl` can be hundreds of MB; see the slow-disk tip in §B8).
-- For long runs, guard against SSH disconnects with `tmux` (or `nohup`).
-
----
 
 # Part B — Reference
 
