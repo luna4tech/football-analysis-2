@@ -117,6 +117,69 @@ def _build_deps() -> RefineDeps:
     )
 
 
+def _build_overlap(tracklets, tids, n):
+    """Build the ``n×n`` boolean temporal-overlap matrix WITHOUT a dense ``n×F``.
+
+    ``overlap[i, j]`` is ``True`` iff tracklets ``tids[i]`` and ``tids[j]`` occupy
+    at least one common frame.  The original code computed this from a dense
+    occupancy matrix ``occ`` of shape ``n × (max_frame + 1)`` (float32, ~2.5 GB at
+    1 h, since ``F ≈ 90,000`` and ``n`` reaches a few thousand) via
+    ``(occ @ occ.T) > 0.5`` — but that dense ``occ`` is the Stage-2 RAM spike and
+    exists ONLY to produce this small ``n×n`` result.
+
+    Sparse occupancy + sparse matmul
+    --------------------------------
+    Occupancy is one-hot-per-frame and extremely sparse (each tracklet occupies a
+    handful of the ``F`` frames), so we store it as a ``scipy.sparse`` CSR matrix
+    of integer 1s and let the sparse product ``occ @ occ.T`` materialize only the
+    ``n×n`` counts.  Entry ``(i, j)`` of that product is ``Σ_f occ[i,f]·occ[j,f]``
+    — exactly the COUNT of frames shared by ``i`` and ``j`` (a non-negative
+    integer), identical to the dense path's product before thresholding.
+
+    Why ``> 0`` is bit-identical to the old ``> 0.5``
+    -------------------------------------------------
+    Shared-frame counts are non-negative integers, so for every entry
+    ``count > 0  ⟺  count ≥ 1  ⟺  count > 0.5``.  No fractional value can ever
+    fall in ``(0, 0.5]``, so ``> 0`` and ``> 0.5`` select the exact same set of
+    cells — the resulting boolean matrix is element-for-element identical to the
+    dense reference.  (Tracklet ``times`` are unique frames per track, so no
+    duplicate ``(i, frame)`` entries are expected; even if one occurred,
+    ``csr_matrix`` SUMS duplicates, which can only inflate an already-positive
+    count and so cannot flip the ``> 0`` boolean — harmless.)
+
+    Returns
+    -------
+    numpy.ndarray
+        A WRITABLE dense ``n×n`` bool ndarray (``.toarray() > 0`` yields exactly
+        that), so the merge loop's in-place ``overlap[t1,:] |= overlap[t2,:]`` and
+        ``np.delete(overlap, t2, ...)`` keep working unchanged.  No ``n×F`` array
+        is ever allocated.
+    """
+    import numpy as np
+    from scipy.sparse import csr_matrix  # lazy/local import, like `import numpy`
+
+    # COO-style triplets for the sparse occupancy matrix:
+    #   rows[k] = tracklet index, cols[k] = frame index, data[k] = 1.
+    # `max_frame` is still needed for the column dimension (the sparse shape);
+    # it never materializes a dense `n × (max_frame + 1)` array.
+    max_frame = max(int(max(t.times)) for t in tracklets.values())
+    rows_list = []
+    cols_list = []
+    for i, tid in enumerate(tids):
+        frames = np.asarray(tracklets[tid].times, dtype=np.int64)
+        rows_list.append(np.full(frames.shape, i, dtype=np.int64))
+        cols_list.append(frames)
+    rows = np.concatenate(rows_list) if rows_list else np.empty(0, dtype=np.int64)
+    cols = np.concatenate(cols_list) if cols_list else np.empty(0, dtype=np.int64)
+    data = np.ones(rows.shape, dtype=np.int64)  # 1 per occupied (tracklet, frame)
+
+    occ = csr_matrix((data, (rows, cols)), shape=(n, max_frame + 1))
+    # Sparse product -> integer shared-frame counts; only the n×n is densified.
+    # `> 0` is identical to the old float `> 0.5` (see docstring), and `.toarray()`
+    # returns a writable dense bool ndarray for the in-place merge-loop updates.
+    return (occ @ occ.T).toarray() > 0  # (n, n) bool: True iff they share a frame
+
+
 def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
     """Exact, batched replacement for ``get_distance_matrix`` + ``merge_tracklets``.
 
@@ -173,11 +236,11 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
         counts[i] = feats.shape[0]
 
     # --- batched temporal-overlap matrix (share >=1 frame -> True) ----------
-    max_frame = max(int(max(t.times)) for t in tracklets.values())
-    occ = np.zeros((n, max_frame + 1), dtype=np.float32)
-    for i, tid in enumerate(tids):
-        occ[i, np.asarray(tracklets[tid].times, dtype=np.int64)] = 1.0
-    overlap = (occ @ occ.T) > 0.5  # (n, n) bool: True iff they share a frame
+    # Built from a SPARSE occupancy matrix so the dense n×F occupancy (~2.5 GB at
+    # 1 h) is never allocated; `_build_overlap` returns a writable dense n×n bool
+    # whose entries are bit-identical to the old `(occ @ occ.T) > 0.5` path (see
+    # its docstring for why integer-count `> 0` equals the old float `> 0.5`).
+    overlap = _build_overlap(tracklets, tids, n)  # (n, n) bool: share a frame
 
     # --- all-pairs distance in ONE matmul -----------------------------------
     Dist = 1.0 - (means @ means.T)

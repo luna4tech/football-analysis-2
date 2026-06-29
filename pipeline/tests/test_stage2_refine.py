@@ -339,6 +339,99 @@ def test_fast_chain_merges_only_similar():
 
 
 # ===========================================================================
+# OPT-3: sparse overlap matrix (_build_overlap) — bit-identical to the dense
+# (occ @ occ.T) > 0.5 reference, with NO dense n×F allocation. (CPU-only)
+# ===========================================================================
+def _dense_overlap_reference(tracklets, tids, n):
+    """The ORIGINAL dense overlap construction, kept here as the test oracle.
+
+    Verbatim re-implementation of the pre-OPT-3 code: a dense float32 occupancy
+    matrix ``occ`` of shape ``n × (max_frame + 1)`` thresholded by the old
+    ``(occ @ occ.T) > 0.5``.  ``_build_overlap`` must equal this element-for-
+    element.
+    """
+    max_frame = max(int(max(t.times)) for t in tracklets.values())
+    occ = np.zeros((n, max_frame + 1), dtype=np.float32)
+    for i, tid in enumerate(tids):
+        occ[i, np.asarray(tracklets[tid].times, dtype=np.int64)] = 1.0
+    return (occ @ occ.T) > 0.5
+
+
+def test_build_overlap_matches_dense_reference():
+    # Mixed temporal relationships in ONE matrix so every pairing is exercised:
+    #   1: frames 0..4
+    #   2: frames 0..4          -> identical frames to 1 (full overlap)
+    #   3: frames 3..7          -> partial overlap with 1 & 2 (shares 3,4)
+    #   4: frames 4..4          -> single shared frame with 1,2,3
+    #   5: frames 100..104      -> disjoint from everything (no overlap)
+    #   6: frames 10..14        -> disjoint from all except itself (no overlap)
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(0, 5), [_V0] * 5),
+        3: _FakeTrack(3, range(3, 8), [_V0] * 5),
+        4: _FakeTrack(4, [4], [_V0]),
+        5: _FakeTrack(5, range(100, 105), [_V0] * 5),
+        6: _FakeTrack(6, range(10, 15), [_V0] * 5),
+    }
+    tids = list(trks.keys())
+    n = len(tids)
+
+    sparse_built = _s2._build_overlap(trks, tids, n)
+    dense_ref = _dense_overlap_reference(trks, tids, n)
+
+    # element-for-element identical booleans.
+    assert sparse_built.shape == (n, n), sparse_built.shape
+    assert sparse_built.dtype == np.bool_, sparse_built.dtype
+    assert np.array_equal(sparse_built, dense_ref), (
+        "sparse-built overlap differs from dense (occ@occ.T)>0.5 reference:\n"
+        "sparse=\n{}\ndense=\n{}".format(sparse_built, dense_ref)
+    )
+
+    # spot-check the intended relationships (guards the fixture, not just equality).
+    idx = {tid: i for i, tid in enumerate(tids)}
+    assert sparse_built[idx[1], idx[2]]       # identical frames -> overlap
+    assert sparse_built[idx[1], idx[3]]       # partial overlap (shares 3,4)
+    assert sparse_built[idx[1], idx[4]]       # single shared frame (4)
+    assert sparse_built[idx[3], idx[4]]       # single shared frame (4)
+    assert not sparse_built[idx[1], idx[5]]   # disjoint
+    assert not sparse_built[idx[1], idx[6]]   # disjoint
+    assert not sparse_built[idx[5], idx[6]]   # disjoint
+    # diagonal: a tracklet always shares all its own frames.
+    for tid in tids:
+        assert sparse_built[idx[tid], idx[tid]]
+
+
+def test_build_overlap_writable_dense_bool_ndarray():
+    # The merge loop mutates overlap in place; the result must be a writable dense
+    # numpy bool ndarray supporting |= row-or and np.delete.
+    trks = {
+        1: _FakeTrack(1, range(0, 5), [_V0] * 5),
+        2: _FakeTrack(2, range(2, 7), [_V0] * 5),
+        3: _FakeTrack(3, range(10, 15), [_V0] * 5),
+    }
+    tids = list(trks.keys())
+    overlap = _s2._build_overlap(trks, tids, len(tids))
+    assert isinstance(overlap, np.ndarray), type(overlap)
+    assert overlap.dtype == np.bool_, overlap.dtype
+    assert overlap.flags.writeable, "overlap must be writable for in-place merge updates"
+    # the exact in-place ops the merge loop performs must not raise.
+    overlap[0, :] |= overlap[1, :]
+    overlap[:, 0] = overlap[0, :]
+    smaller = np.delete(np.delete(overlap, 1, axis=0), 1, axis=1)
+    assert smaller.shape == (2, 2), smaller.shape
+
+
+def test_build_overlap_single_tracklet():
+    # n == 1 yields a 1×1 overlap (diagonal True); matches the dense reference.
+    trks = {1: _FakeTrack(1, range(0, 5), [_V0] * 5)}
+    tids = list(trks.keys())
+    sparse_built = _s2._build_overlap(trks, tids, 1)
+    dense_ref = _dense_overlap_reference(trks, tids, 1)
+    assert sparse_built.shape == (1, 1), sparse_built.shape
+    assert np.array_equal(sparse_built, dense_ref), (sparse_built, dense_ref)
+
+
+# ===========================================================================
 # Refined-tracklets pkl export (_renumber_and_export_pkl) — CPU-only
 # ===========================================================================
 def test_export_pkl_keys_match_save_results_renumbering():
@@ -718,6 +811,9 @@ _TESTS = [
     ("fast_connect: temporal overlap blocks merge", test_fast_overlap_blocks_merge),
     ("fast_connect: spatial-gate veto blocks merge", test_fast_spatial_gate_blocks_merge),
     ("fast_connect: chain merges only the similar pair", test_fast_chain_merges_only_similar),
+    ("build_overlap: sparse == dense (occ@occ.T)>0.5 reference", test_build_overlap_matches_dense_reference),
+    ("build_overlap: writable dense bool ndarray for merge loop", test_build_overlap_writable_dense_bool_ndarray),
+    ("build_overlap: single tracklet 1x1 overlap", test_build_overlap_single_tracklet),
     ("export_pkl: keys match save_results i+1 renumbering", test_export_pkl_keys_match_save_results_renumbering),
     ("export_pkl: track_id set on exported objects", test_export_pkl_track_id_set_on_objects),
     ("export_pkl: misaligned arrays trip the invariant assertion", test_export_pkl_asserts_array_alignment),
