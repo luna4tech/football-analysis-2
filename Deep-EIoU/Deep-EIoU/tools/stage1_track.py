@@ -207,6 +207,49 @@ class YOLOv11Detector:
             return None
         return ultralytics_result_to_yolox_output(results[0])
 
+    def infer_many(self, frames):
+        """Batched detection: one YOLOX-shaped output (or ``None``) per frame.
+
+        This is the batched analogue of ``infer_one``.  Ultralytics' ``predict``
+        accepts a LIST source and runs the whole list in one (or a few internal)
+        forward pass(es) — replacing ``len(frames)`` separate ``predict`` launches
+        with a single call and amortizing the per-call Python/CUDA overhead that
+        dominates Stage 1's wall time.
+
+        The SAME ``conf``/``iou``/``imgsz``/``half``/``device`` kwargs as
+        ``infer_one`` are used (via the shared ``_predict``), so per-frame
+        post-processing is bit-for-bit the single-frame path — only the *grouping*
+        of the forward pass changes, never the per-frame detection math.
+
+        Ordering guarantee
+        -------------------
+        Ultralytics returns its ``Results`` list in input order, so element ``k``
+        of the returned list corresponds to ``frames[k]``.  We always return a
+        list of exactly ``len(frames)`` entries (``None`` where a frame produced
+        no usable output), so callers can zip results back to frames by index.
+
+        Parameters
+        ----------
+        frames:
+            A list of BGR frames (each ``H x W x 3`` uint8), in ascending frame
+            order.
+
+        Returns
+        -------
+        list
+            ``len(frames)`` entries; entry ``k`` is the YOLOX-shaped output for
+            ``frames[k]`` (from ``ultralytics_result_to_yolox_output``) or
+            ``None`` when that frame yielded nothing.
+        """
+        if not frames:
+            return []
+        results = self._predict(list(frames))
+        # Defensive: if Ultralytics returned nothing at all, treat every frame as
+        # empty rather than letting a zip silently drop frames.
+        if not results:
+            return [None] * len(frames)
+        return [ultralytics_result_to_yolox_output(r) for r in results]
+
 
 # ---------------------------------------------------------------------------
 # Producer: pure per-frame perception (no cross-frame state)
@@ -233,6 +276,111 @@ def perceive(frame, detector, extractor, width, height):
     embs = extractor(crops)
     embs = embs.cpu().detach().numpy()
     return det, embs
+
+
+def perceive_batch(frames, detector, extractor, width, height):
+    """Batched producer: ``perceive`` applied to a window of frames at once.
+
+    This is the batched analogue of ``perceive`` and reproduces its per-frame
+    contract EXACTLY — the ONLY difference is that detection and ReID are each
+    run once for the whole window instead of once per frame:
+
+      * Detection is batched via ``detector.infer_many(frames)`` (one Ultralytics
+        ``predict`` over the list instead of N predicts).
+      * ReID is batched by concatenating EVERY frame's crops into a single list,
+        calling ``extractor(all_crops)`` ONCE, then splitting the embeddings back
+        out per frame.
+
+    Per-frame post-detection math (``det_and_crops_from_output``) and the
+    per-frame result shapes are untouched, so for any given per-frame detector
+    output + crops this returns the identical ``(det, embs)`` that looping
+    ``perceive`` would — see the CPU equivalence test in
+    ``pipeline/tests/test_stage1_perceive_batch.py``.
+
+    Ordering guarantee (the correctness crux)
+    ------------------------------------------
+    Crops are concatenated in **frame order**, and **within each frame in
+    det-row order** (``det_and_crops_from_output`` returns ``crops`` aligned 1:1
+    with ``det`` rows).  We record each frame's crop COUNT, run the extractor on
+    the flat list, then slice the returned embeddings back using the running
+    offsets — so embedding row ``j`` of frame ``k`` maps to ``det`` row ``j`` of
+    frame ``k``.  Because concatenation and the split use the same offsets, the
+    mapping is exact and never crosses a frame boundary.
+
+    Parameters
+    ----------
+    frames:
+        A list of BGR frames (each ``H x W x 3`` uint8), in ascending frame
+        order.
+    detector, extractor, width, height:
+        Same objects/values as ``perceive``.
+
+    Returns
+    -------
+    list of (det, embs)
+        One tuple per input frame, in input order.  Each tuple matches
+        ``perceive`` exactly:
+          * ``det is None``         -> ``(None, None)``       (detector empty)
+          * ``len(crops) == 0``     -> ``(det, np.empty((0, 0), dtype=np.float32))``
+          * otherwise               -> ``(det, embs_slice)``  (one row per det row)
+    """
+    if not frames:
+        return []
+
+    # 1) Batched detection — one predict over the whole window, in frame order.
+    outputs = detector.infer_many(frames)
+
+    # 2) Per-frame post-detection math + crop collection.  We keep three parallel
+    #    lists indexed by frame position so we can rebuild results after the
+    #    single batched extractor call:
+    #      - per_frame_det:   the cleaned det array, or None
+    #      - per_frame_count: number of crops for that frame (0 when det is None
+    #                         or det has no surviving rows)
+    #      - all_crops:       the flat, frame-then-row-ordered crop list
+    per_frame_det = []
+    per_frame_count = []
+    all_crops = []
+    for k, frame in enumerate(frames):
+        det, crops = det_and_crops_from_output(outputs[k], frame, width, height)
+        if det is None:
+            per_frame_det.append(None)
+            per_frame_count.append(0)
+            continue
+        per_frame_det.append(det)
+        if crops:
+            per_frame_count.append(len(crops))
+            all_crops.extend(crops)  # frame order preserved; row order within frame
+        else:
+            per_frame_count.append(0)
+
+    # 3) Single batched ReID call over every crop in the window.  Skip entirely
+    #    when the whole window produced no crops (no empty-tensor extractor call).
+    all_embs = None
+    if all_crops:
+        embs = extractor(all_crops)
+        all_embs = embs.cpu().detach().numpy()
+
+    # 4) Split the flat embeddings back per frame using running offsets, and
+    #    rebuild each frame's result to match ``perceive`` byte-for-byte.
+    results = []
+    offset = 0
+    for det, count in zip(per_frame_det, per_frame_count):
+        if det is None:
+            # Detector produced nothing for this frame -> mirror perceive's
+            # (None, None) / demo.py's "outputs[0] is None" branch.
+            results.append((None, None))
+            continue
+        if count == 0:
+            # det present but no surviving crops -> empty embeddings, same shape
+            # and dtype perceive returns for the 0-crop case.
+            results.append((det, np.empty((0, 0), dtype=np.float32)))
+            continue
+        # Slice this frame's contiguous block out of the batched embeddings.
+        embs_slice = all_embs[offset:offset + count]
+        offset += count
+        results.append((det, embs_slice))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -282,27 +430,48 @@ def run_stage1(detector, extractor, args, paths):
     frame_id = 0
     emb_dim = 0
 
+    # Window size for the batched producer.  Detection + ReID run once per window
+    # (instead of once per frame), then the consumer replays the window one frame
+    # at a time in strict ascending order — the tracker is sequential and cannot
+    # be batched.  Default 16 keeps a high-res batch within T4 VRAM.
+    batch_size = max(1, int(getattr(args, "batch_size", 16)))
+
     while True:
-        if frame_id % 30 == 0:
-            logger.info(
-                "Processing frame {} ({:.2f} fps)".format(
-                    frame_id, 1.0 / max(1e-5, timer.average_time)
-                )
-            )
-        ret_val, frame = cap.read()
-        if not ret_val:
+        # --- read up to batch_size frames (handles the final partial window) ---
+        # We buffer one window of frames, then perceive them all at once.  A short
+        # read (fewer than batch_size frames) is the last window before EOF; an
+        # empty read means the video is exhausted and we stop.
+        window_frames = []
+        for _ in range(batch_size):
+            ret_val, frame = cap.read()
+            if not ret_val:
+                break
+            window_frames.append(frame)
+        if not window_frames:
             break
 
+        logger.info(
+            "Processing frames {}..{} ({:.2f} fps)".format(
+                frame_id,
+                frame_id + len(window_frames) - 1,
+                1.0 / max(1e-5, timer.average_time),
+            )
+        )
+
         timer.tic()
-        # Producer — strictly per-frame, no state.
-        det, embs = perceive(frame, detector, extractor, width, height)
-        if embs is not None and embs.size:
-            emb_dim = embs.shape[1]
-        # Consumer — strict frame order; carries the tracker state.
-        track_consume(frame_id, det, embs, tracker, assembler, args.min_box_area)
+        # Producer — batched perception over the whole window.  No cross-frame
+        # state; results come back in frame order, one (det, embs) per frame.
+        window = perceive_batch(window_frames, detector, extractor, width, height)
         timer.toc()
 
-        frame_id += 1
+        # Consumer — strict frame order; carries the tracker state.  frame_id is
+        # advanced exactly once per frame so track_consume always sees strictly
+        # ascending ids, identical to the old per-frame loop.
+        for det, embs in window:
+            if embs is not None and embs.size:
+                emb_dim = embs.shape[1]
+            track_consume(frame_id, det, embs, tracker, assembler, args.min_box_area)
+            frame_id += 1
 
     cap.release()
 
@@ -362,6 +531,16 @@ def make_parser():
         action="store_true",
         default=False,
         help="force recompute even if cached outputs are up-to-date",
+    )
+    parser.add_argument(
+        "--batch-size",
+        default=16,
+        type=int,
+        help=(
+            "number of frames to perceive (detect + ReID) per batch before "
+            "replaying the tracker frame-by-frame (default: 16). Tracking stays "
+            "sequential; only detection/ReID are batched."
+        ),
     )
     return parser
 
