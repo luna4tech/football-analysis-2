@@ -29,8 +29,19 @@ Colab preinstalls most of this; a bare GPU VM does not. From scratch you need:
    ```bash
    sudo apt-get install -y libgl1 libglib2.0-0
    ```
-4. **`torch` / `torchvision`** — Colab ships these; from scratch, install a CUDA
-   build matching your driver (see <https://pytorch.org>).
+4. **`torch` / `torchvision`** — Colab ships these; on a bare VM install a CUDA
+   build yourself **before** step 5 (otherwise step 5 pulls a CPU-only torch).
+   Check the CUDA version your driver supports — the top-right of `nvidia-smi`
+   ("CUDA Version: …") — then install the matching wheel from PyTorch's index:
+   ```bash
+   # pick the cuXXX matching your driver (cu121 is a safe default on recent
+   # drivers; cu124 for newer, cu118 for older):
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+   ```
+   Verify the GPU is visible before continuing:
+   ```bash
+   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # expect: <ver> True
+   ```
 5. **The pipeline dependencies**, in this order:
    ```bash
    pip install -r gta-link/requirements.txt
