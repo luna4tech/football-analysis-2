@@ -46,7 +46,7 @@ Colab preinstalls most of this; a bare GPU VM does not. From scratch you need:
    ```bash
    pip install -r gta-link/requirements.txt
    pip install cython_bbox tqdm ultralytics
-   pip install -e Deep-EIoU/Deep-EIoU/reid
+   pip install -e Deep-EIoU/Deep-EIoU/reid --no-build-isolation
    ```
    `gta-link/requirements.txt` is the comprehensive set (it covers Stage 2's refine
    libraries **and** the import-time deps of the bundled torchreid that Stage 1's
@@ -347,7 +347,47 @@ python tools/render_from_txt.py --path /abs/path/clip.mp4 \
 
 Each writes `<txt>_rendered.mp4` next to the `.txt` (or pass `--save_path`).
 
-## B9. Dependency rationale & troubleshooting
+## B9. Evaluate (HOTA / MOTA / IDF1 + class/team)
+
+Score the pipeline's `refined.txt` against ground truth. The evaluator is
+**standalone and CPU-only** (stdlib + numpy; no GPU or pipeline runtime) and reports
+**HOTA / DetA / AssA / MOTA / IDF1** via TrackEval, plus class/team attribute metrics.
+
+**Setup — TrackEval** (not pip-installed; clone it and pass its path):
+
+```bash
+git clone https://github.com/JonathonLuiten/TrackEval.git /path/to/TrackEval
+# TrackEval still uses the removed np.float / np.int / np.bool aliases; on modern
+# numpy, patch them to the builtins once:
+grep -rl 'np\.float\|np\.int\|np\.bool' /path/to/TrackEval/trackeval \
+  | xargs -r sed -i 's/np\.float\b/float/g; s/np\.int\b/int/g; s/np\.bool\b/bool/g'
+```
+
+**Run:**
+
+```bash
+python -m eval.evaluate \
+    --pred /abs/path/out/<stem>/03_team/refined.txt \
+    --gt   /abs/path/gt_mot_<stem>.txt \
+    --seq-name <stem> \
+    --trackeval-path /path/to/TrackEval \
+    --out  /abs/path/out/<stem>/eval/metrics.json
+```
+
+Or pass `--video clip.mp4` (with `--artifacts-dir`) instead of `--pred` to auto-locate
+`refined.txt` (prefers `03_team/`, falls back to `02_refine/`).
+
+- **GT format:** MOTChallenge `gt.txt` (**1-based** frames); the pipeline's **0-based**
+  output is converted automatically (`--gt-format` defaults to `motchallenge`).
+- **Class label:** TrackEval scores under `--class-name` (default `pedestrian`); override
+  only if your GT uses a different label.
+- **Outputs** (next to `--out`, i.e. `<stem>/eval/`):
+  - `metrics.json` — the 5 headline metrics + the full per-family dump (HOTA / CLEAR /
+    Identity / Count).
+  - `attributes_metrics.json` — class/team attribute accuracy. This step is **non-fatal**:
+    if it fails, the HOTA/MOTA results above still stand.
+
+## B10. Dependency rationale & troubleshooting
 
 **Why these deps.** `gta-link/requirements.txt` is the comprehensive set because it
 covers both Stage 2's refine libraries and the import-time deps of the vendored torchreid
