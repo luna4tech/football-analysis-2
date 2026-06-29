@@ -198,7 +198,10 @@ def assign_teams(tracklets, cluster_fn=_kmeans_cluster):
     1. Per track, aggregate class = confidence-weighted mode of ``class_ids``;
        ``gk = (class == goalkeeper)``.
     2. Player tracks = aggregated class ``player``; per player track the mean
-       embedding = L2-normalize(mean of its features).
+       embedding is the precomputed ``mean_emb`` when present (the slim
+       ``refined_tracklets.pkl`` Stage 2 writes by default), else
+       ``_mean_embedding`` of its features (back-compat with old / full pkls and
+       Stage 2's ``--keep-features`` output).
     3. With >= 2 player tracks (that have usable embeddings): cluster the mean
        embeddings with the injected ``cluster_fn`` (k=2), then remap raw labels
        to deterministic team ids (larger cluster -> 0, tie-break lowest min id).
@@ -227,7 +230,12 @@ def assign_teams(tracklets, cluster_fn=_kmeans_cluster):
             "gk": bool(cls == GOALKEEPER_CLASS),
         }
         if cls == PLAYER_CLASS:
-            emb = _mean_embedding(getattr(track, "features", None) or [])
+            # Prefer the precomputed mean (slim pkl); fall back to computing it
+            # from the per-frame features (old / full pkls, --keep-features).  A
+            # track whose mean is None (no features) is skipped from clustering.
+            emb = getattr(track, "mean_emb", None)
+            if emb is None:
+                emb = _mean_embedding(getattr(track, "features", None) or [])
             if emb is not None:
                 player_ids.append(tid)
                 player_embeddings.append(emb)

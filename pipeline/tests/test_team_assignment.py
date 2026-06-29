@@ -40,7 +40,21 @@ for _p in (_REPO_ROOT, _GTA_LINK_DIR):
         sys.path.insert(0, str(_p))
 
 from pipeline import team_assignment as ta
-from Tracklet import Tracklet  # noqa: E402 — light, no heavy deps
+import Tracklet  # noqa: E402, F401 — registers sys.modules["Tracklet"] (light)
+
+
+def _tracklet_cls():
+    """The Tracklet class CURRENTLY registered as the top-level ``Tracklet``.
+
+    Resolved lazily (not captured at import) because other tests
+    (``test_stage1_assembly``) re-load ``gta-link/Tracklet.py`` by file path and
+    overwrite ``sys.modules["Tracklet"]``.  Pickling resolves the class by its
+    module name, so a fixture built from a stale class object would fail with
+    "not the same object as Tracklet.Tracklet" once the suite has swapped the
+    module.  Fetching it from ``sys.modules`` at build time keeps dump/load on
+    the one class object pickle resolves to, regardless of test ordering.
+    """
+    return sys.modules["Tracklet"].Tracklet
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +102,7 @@ def _mk_track(tid, n, class_ids, feat, scores=None):
         scores = [1.0] * n
     feats = [np.asarray(feat, dtype=np.float64) for _ in range(n)]
     bboxes = [[float(f), float(f), 10.0, 20.0] for f in frames]
-    return Tracklet(tid, frames, scores, bboxes, feats=feats, class_ids=class_ids)
+    return _tracklet_cls()(tid, frames, scores, bboxes, feats=feats, class_ids=class_ids)
 
 
 # A fake cluster function: assigns labels by the SIGN of the first embedding

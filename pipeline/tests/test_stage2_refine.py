@@ -56,6 +56,29 @@ _s2 = _load_stage2()
 run_refine = _s2.run_refine
 RefineDeps = _s2.RefineDeps
 
+# Stage 3 + the real Tracklet class for the OPT-1 slim-pkl equivalence tests.
+# stage2_refine put the repo root on sys.path at import; add gta-link so the
+# real `Tracklet` (used for a faithful pickle round-trip) resolves as the
+# top-level module name the pickle references.
+if str(_GTA_LINK_DIR) not in sys.path:
+    sys.path.insert(0, str(_GTA_LINK_DIR))
+from pipeline import team_assignment as _ta  # noqa: E402
+import Tracklet  # noqa: E402, F401 — registers sys.modules["Tracklet"] (light)
+
+
+def _Tracklet(*args, **kwargs):
+    """Construct a Tracklet from the class CURRENTLY registered as ``Tracklet``.
+
+    Other tests (e.g. ``test_stage1_assembly``) re-load ``gta-link/Tracklet.py``
+    by file path and overwrite ``sys.modules["Tracklet"]`` with a fresh module
+    object.  Pickling resolves the class by its module name, so a fixture built
+    from a stale class object would fail with "not the same object as
+    Tracklet.Tracklet" once the suite has swapped the module.  Resolving the
+    class lazily from ``sys.modules`` at build time keeps dump/load using the
+    one class object pickle will resolve to, regardless of test ordering.
+    """
+    return sys.modules["Tracklet"].Tracklet(*args, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Minimal test runner (no pytest)
@@ -372,9 +395,13 @@ def test_run_refine_writes_pkl_with_matching_ids():
     rec = _Recorder(split_output=split_out, spatial_ok=True)
     with tempfile.TemporaryDirectory() as td:
         pkl_path = str(Path(td) / "refined_tracklets.pkl")
+        # keep_features=True so this asserts the FULL-array export invariant (the
+        # slim default clears times/bboxes/features by design — covered by the
+        # OPT-1 slim_pkl tests below).
         run_refine(
             {1: object(), 2: object()}, _REFINED_TXT, _params(),
             _deps_from(rec), seq_name="clip", refined_pkl=pkl_path,
+            keep_features=True,
         )
         import pickle as _pickle
         with open(pkl_path, "rb") as f:
@@ -397,6 +424,163 @@ def test_run_refine_no_pkl_when_path_omitted():
     rec = _Recorder(split_output=split_out)
     counts = run_refine({1: object()}, _REFINED_TXT, _params(), _deps_from(rec), seq_name="clip")
     assert counts["n_tracklets_out"] == 1, counts  # ran fine without a pkl path
+
+
+# ===========================================================================
+# OPT-1: slim refined_tracklets.pkl — Stage 3 output is bit-identical whether
+# it consumes the FULL pkl or the SLIMMED-then-exported pkl (CPU-only).
+# ===========================================================================
+# Distinct class ids from the shared map: player=2, goalkeeper=1, referee=3.
+_PLAYER = _ta.PLAYER_CLASS
+_GK = _ta.GOALKEEPER_CLASS
+_REF = _ta.REFEREE_CLASS
+
+# Two well-separated unit directions so the fake cluster fn (sign of comp 0)
+# cleanly splits the players into two teams.
+_POS = [1.0, 0.0, 0.0, 0.0]
+_NEG = [-1.0, 0.0, 0.0, 0.0]
+
+
+def _fake_cluster_by_sign(embeddings, k, **kwargs):
+    """Deterministic CPU clusterer: label by the sign of the first component."""
+    return [0 if np.asarray(e).ravel()[0] >= 0 else 1 for e in embeddings]
+
+
+def _mk_real_track(tid, n, class_id, feat):
+    """Build a real ``Tracklet`` with ``n`` frames (varied per-frame features).
+
+    Per-frame features are jittered around ``feat`` so the stored mean is a
+    genuine average over differing vectors — exercising the order-independence
+    that makes the precomputed mean equal to Stage 3's on-the-fly mean.
+    """
+    rng = np.random.default_rng(tid)
+    base = np.asarray(feat, dtype=np.float64)
+    frames = list(range(n))
+    scores = [1.0] * n
+    bboxes = [[float(f), float(f), 10.0, 20.0] for f in frames]
+    feats = [base + 0.05 * rng.standard_normal(base.size) for _ in frames]
+    class_ids = [class_id] * n
+    return _Tracklet(tid, frames, scores, bboxes, feats=feats, class_ids=class_ids)
+
+
+def _fixture_tracklets():
+    """A small ``{id: Tracklet}``: 3 players (2 +cluster, 1 -cluster), 1 GK, 1 ref."""
+    return {
+        1: _mk_real_track(1, 6, _PLAYER, _POS),
+        2: _mk_real_track(2, 7, _PLAYER, _POS),
+        3: _mk_real_track(3, 5, _PLAYER, _NEG),
+        4: _mk_real_track(4, 4, _GK, _POS),
+        5: _mk_real_track(5, 8, _REF, _NEG),
+    }
+
+
+def _export_and_load(out, keep_features):
+    """Export ``out`` via Stage 2's pkl writer, then unpickle it back."""
+    import pickle as _pickle
+
+    with tempfile.TemporaryDirectory() as td:
+        pkl_path = str(Path(td) / "refined_tracklets.pkl")
+        _s2._renumber_and_export_pkl(out, pkl_path, keep_features=keep_features)
+        with open(pkl_path, "rb") as f:
+            return _pickle.load(f)
+
+
+def test_slim_pkl_stage3_identical_to_full():
+    # Stage 3 (assign_teams) over the FULL export must equal Stage 3 over the
+    # SLIMMED-then-exported pkl: the precomputed mean_emb == on-the-fly mean.
+    full = _export_and_load(_fixture_tracklets(), keep_features=True)
+    slim = _export_and_load(_fixture_tracklets(), keep_features=False)
+
+    attrs_full = _ta.assign_teams(full, cluster_fn=_fake_cluster_by_sign)
+    attrs_slim = _ta.assign_teams(slim, cluster_fn=_fake_cluster_by_sign)
+    assert attrs_full == attrs_slim, (attrs_full, attrs_slim)
+
+
+def test_slim_pkl_track_attributes_json_identical_to_full():
+    # The WRITTEN track_attributes.json must be byte-identical for full vs slim.
+    import json
+
+    full = _export_and_load(_fixture_tracklets(), keep_features=True)
+    slim = _export_and_load(_fixture_tracklets(), keep_features=False)
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        af, as_ = td / "full.json", td / "slim.json"
+        _ta.write_track_attributes(
+            str(af), _ta.assign_teams(full, cluster_fn=_fake_cluster_by_sign)
+        )
+        _ta.write_track_attributes(
+            str(as_), _ta.assign_teams(slim, cluster_fn=_fake_cluster_by_sign)
+        )
+        assert af.read_text(encoding="utf-8") == as_.read_text(encoding="utf-8")
+        # And it is the expected schema/content (3 players teamed, GK/ref -1).
+        data = json.loads(as_.read_text(encoding="utf-8"))
+        assert data["1"]["team"] == 0 and data["2"]["team"] == 0, data
+        assert data["3"]["team"] == 1, data
+        assert data["4"]["team"] == -1 and data["4"]["gk"] is True, data
+        assert data["5"]["team"] == -1 and data["5"]["gk"] is False, data
+
+
+def test_slim_pkl_drops_arrays_keeps_mean_and_class():
+    # Acceptance: slim carries mean_emb + class_ids + scores; NO per-detection
+    # features / times / bboxes.
+    slim = _export_and_load(_fixture_tracklets(), keep_features=False)
+    for tid, track in slim.items():
+        assert getattr(track, "mean_emb", None) is not None, tid
+        assert track.features == [] and track.times == [] and track.bboxes == [], tid
+        assert len(track.class_ids) > 0 and len(track.scores) > 0, tid
+
+
+def test_keep_features_reproduces_full_pkl():
+    # --keep-features path: per-detection arrays intact, NO mean_emb attribute.
+    full = _export_and_load(_fixture_tracklets(), keep_features=True)
+    for tid, track in full.items():
+        assert not hasattr(track, "mean_emb"), tid
+        n = len(track.times)
+        assert (
+            len(track.bboxes) == n
+            and len(track.features) == n
+            and len(track.scores) == n
+            and len(track.class_ids) == n
+            and n > 0
+        ), (tid, n)
+
+
+def _featureless_fixture():
+    """3 players, but track 3 has NO features (all five arrays empty, aligned).
+
+    Built fresh on each call because ``_renumber_and_export_pkl`` mutates the
+    Tracklets in place (slim mode clears arrays / sets ``mean_emb``).
+    """
+    out = {
+        1: _mk_real_track(1, 6, _PLAYER, _POS),
+        2: _mk_real_track(2, 6, _PLAYER, _NEG),
+        3: _mk_real_track(3, 5, _PLAYER, _POS),
+    }
+    # Strip track 3's features (keep ALL five arrays mutually aligned — here all
+    # empty — so the export-time alignment assert still passes on the full arrays).
+    out[3].features = []
+    out[3].times = []
+    out[3].bboxes = []
+    out[3].scores = []
+    out[3].class_ids = []
+    return out
+
+
+def test_slim_pkl_mean_emb_none_for_featureless_track():
+    # Edge case: a player track with NO features -> mean_emb is None -> it is
+    # skipped from clustering, exactly as the full-pkl path skips it.
+    slim = _export_and_load(_featureless_fixture(), keep_features=False)
+    # The featureless track's stored mean is None.
+    none_track = next(t for t in slim.values() if not t.class_ids)
+    assert getattr(none_track, "mean_emb", "missing") is None
+
+    # The equivalent FULL export (same data) -> Stage 3 output must match: the
+    # featureless player is excluded from clustering in BOTH.
+    full = _export_and_load(_featureless_fixture(), keep_features=True)
+    attrs_full = _ta.assign_teams(full, cluster_fn=_fake_cluster_by_sign)
+    attrs_slim = _ta.assign_teams(slim, cluster_fn=_fake_cluster_by_sign)
+    assert attrs_full == attrs_slim, (attrs_full, attrs_slim)
 
 
 # ===========================================================================
@@ -539,6 +723,11 @@ _TESTS = [
     ("export_pkl: misaligned arrays trip the invariant assertion", test_export_pkl_asserts_array_alignment),
     ("run_refine: writes pkl with ids matching refined.txt", test_run_refine_writes_pkl_with_matching_ids),
     ("run_refine: no pkl export when path omitted", test_run_refine_no_pkl_when_path_omitted),
+    ("slim_pkl: Stage 3 assign_teams identical full vs slim", test_slim_pkl_stage3_identical_to_full),
+    ("slim_pkl: track_attributes.json identical full vs slim", test_slim_pkl_track_attributes_json_identical_to_full),
+    ("slim_pkl: drops features/times/bboxes, keeps mean_emb+class+scores", test_slim_pkl_drops_arrays_keeps_mean_and_class),
+    ("slim_pkl: --keep-features reproduces full pkl (no mean_emb)", test_keep_features_reproduces_full_pkl),
+    ("slim_pkl: mean_emb None for featureless track (edge)", test_slim_pkl_mean_emb_none_for_featureless_track),
     ("run_refine: optional real end-to-end refine (skips w/o deps)", test_optional_end_to_end_real_refine),
     ("split: optional real split preserves class_ids (skips w/o deps)", test_optional_split_preserves_class_ids),
 ]

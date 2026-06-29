@@ -237,7 +237,7 @@ def _fast_connect(tracklets, deps, max_x_range, max_y_range, merge_dist_thres):
     return tracklets
 
 
-def _renumber_and_export_pkl(out, refined_pkl):
+def _renumber_and_export_pkl(out, refined_pkl, keep_features=False):
     """Export ``out`` as ``{new_id: Tracklet}`` with ids matching refined.txt.
 
     ``save_results`` renumbers tracks as ``new_id = i + 1`` over
@@ -245,9 +245,45 @@ def _renumber_and_export_pkl(out, refined_pkl):
     Tracklet's ``.track_id`` to its ``new_id`` so the dict key, the attribute,
     and the ids written to ``refined.txt`` all agree.
 
-    Also asserts the per-frame invariant for every exported track:
+    Also asserts the per-frame invariant for every exported track ON THE FULL
+    arrays (before any slimming):
     ``len(times) == len(bboxes) == len(features) == len(scores) == len(class_ids)``.
+
+    Slimming (``keep_features=False``, the default)
+    -----------------------------------------------
+    Stage 3 (``pipeline.team_assignment``) is the ONLY consumer of this pkl and
+    collapses each track's ``features`` to a single mean embedding via
+    ``_mean_embedding``; it also uses ``class_ids`` + ``scores`` (for
+    ``aggregate_class``) and never reads ``times`` / ``bboxes`` / individual
+    feature vectors.  So in slim mode, per track we precompute
+    ``mean = _mean_embedding(track.features)`` with the SHARED Stage-3 function
+    (``mean`` is order-independent, so computing it from the merged feature list
+    here equals what Stage 3 would compute from the same list — keeping the
+    Stage-3 outputs bit-identical), store it on a new ``mean_emb`` attribute,
+    then drop the heavy per-detection arrays (``features`` ~4 GB at 1 h) by
+    clearing ``features`` / ``times`` / ``bboxes``.  ``scores`` and ``class_ids``
+    are kept.  ``save_results`` (which writes ``refined.txt`` from
+    ``times`` / ``bboxes``) has already run by the time we are called, so this
+    stripping does NOT affect ``refined.txt``.
+
+    Parameters
+    ----------
+    out:
+        Merged ``{tid: Tracklet}`` to export.
+    refined_pkl:
+        Output path for ``refined_tracklets.pkl``.
+    keep_features:
+        When ``True``, export the full ``Tracklet`` exactly as before (no
+        slimming, no ``mean_emb``) — reproduces today's full pkl.  Default
+        ``False`` (slim).
     """
+    # Shared with Stage 3 so the stored mean is bit-identical to what Stage 3
+    # would compute from the same feature list.  Imported here (not at module
+    # top) so the slim path's dependency is explicit and local; the repo root is
+    # already on sys.path (added above), so this resolves under CWD = gta-link.
+    if not keep_features:
+        from pipeline.team_assignment import _mean_embedding
+
     renumbered = {}
     for i, tid in enumerate(sorted(out.keys())):
         track = out[tid]
@@ -266,13 +302,23 @@ def _renumber_and_export_pkl(out, refined_pkl):
                 len(track.scores), len(track.class_ids),
             )
         )
+        if not keep_features:
+            # Precompute the per-track mean embedding (np.ndarray or None), then
+            # drop the heavy per-detection arrays.  Validate alignment FIRST (the
+            # assert above), then compute the mean, then strip — never assert the
+            # per-frame invariant after slimming.
+            track.mean_emb = _mean_embedding(track.features)
+            track.features = []
+            track.times = []
+            track.bboxes = []
         renumbered[new_id] = track
 
     with open(refined_pkl, "wb") as f:
         pickle.dump(renumbered, f)
 
 
-def run_refine(tmp, refined_txt, params, deps, seq_name, refined_pkl=None):
+def run_refine(tmp, refined_txt, params, deps, seq_name, refined_pkl=None,
+               keep_features=False):
     """Refine ONE pkl's tracklets: split, then connect/merge.
 
     Mirrors refine_tracklets.main()'s per-seq body (split THEN connect) for a
@@ -310,6 +356,11 @@ def run_refine(tmp, refined_txt, params, deps, seq_name, refined_pkl=None):
         merged tracklets are exported as ``{new_id: Tracklet}`` using the SAME
         ``i + 1`` renumbering ``save_results`` applies, so the pkl ids match
         ``refined.txt``.
+    keep_features:
+        Forwarded to ``_renumber_and_export_pkl``.  When ``False`` (default) the
+        exported pkl is slimmed (per-track ``mean_emb`` + ``scores`` +
+        ``class_ids``, no per-detection ``features`` / ``times`` / ``bboxes``);
+        when ``True`` the full ``Tracklet`` is exported exactly as before.
 
     Returns
     -------
@@ -361,7 +412,7 @@ def run_refine(tmp, refined_txt, params, deps, seq_name, refined_pkl=None):
 
     # Export {new_id: Tracklet} with ids matching the just-written refined.txt.
     if refined_pkl is not None:
-        _renumber_and_export_pkl(out, refined_pkl)
+        _renumber_and_export_pkl(out, refined_pkl, keep_features=keep_features)
 
     return {
         "n_tracklets_in": n_tracklets_in,
@@ -406,6 +457,15 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="force recompute even if cached outputs are up-to-date",
+    )
+    parser.add_argument(
+        "--keep-features",
+        action="store_true",
+        default=False,
+        help="export the FULL refined_tracklets.pkl (per-detection features / "
+        "times / bboxes intact, no precomputed mean_emb).  Default is the slim "
+        "pkl: a per-track mean embedding + scores + class_ids only (Stage 3, the "
+        "sole consumer, reads just those), which drops the ~4 GB of features.",
     )
 
     # --- refine params (same names + defaults as refine_tracklets.parse_args) ---
@@ -514,7 +574,8 @@ def main(args) -> None:
 
     with profile_stage("02_refine", paths, extra=io_counts):
         counts = run_refine(
-            tmp, str(refined_txt), params, deps, seq_name, refined_pkl=str(refined_pkl)
+            tmp, str(refined_txt), params, deps, seq_name,
+            refined_pkl=str(refined_pkl), keep_features=args.keep_features,
         )
         io_counts.update(counts)
         # n_output_rows: total MOT rows written (sum of tracklet lengths in

@@ -36,11 +36,18 @@ class Tracklet:
         Tracklets pickled before class_ids existed bypass __init__ on load, so
         their __dict__ has no class_ids and would AttributeError in append_det /
         extract. Ensure class_ids exists and is length-aligned with times,
-        defaulting to -1 (unknown) when missing or length-mismatched.
+        defaulting to -1 (unknown) when missing or SHORTER than times.
+
+        The slim refined_tracklets.pkl (Stage 2's OPT-1 export) deliberately
+        clears times/bboxes/features while KEEPING class_ids + scores (Stage 3
+        reads those), so class_ids is intentionally LONGER than the emptied
+        times. That is not a legacy mismatch, so it is left intact — only a
+        missing or short class_ids is backfilled.
         '''
         self.__dict__.update(state)
         times = getattr(self, 'times', [])
-        if getattr(self, 'class_ids', None) is None or len(self.class_ids) != len(times):
+        class_ids = getattr(self, 'class_ids', None)
+        if class_ids is None or len(class_ids) < len(times):
             self.class_ids = [-1] * len(times)
 
     def append_det(self, frame, score, bbox, class_id=-1):
