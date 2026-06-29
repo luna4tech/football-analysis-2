@@ -1,6 +1,6 @@
 # Pipeline Optimizations — Plan
 
-Implements OPT-1, OPT-3, OPT-2 from [OPTIMIZATION_NOTES.md](../../../OPTIMIZATION_NOTES.md),
+Implements OPT-1, OPT-3, OPT-2 from [OPTIMIZATION_NOTES.md](OPTIMIZATION_NOTES.md),
 in that order. OPT-4/5/6 and float16 are out of scope.
 
 ## Ground rules
