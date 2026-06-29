@@ -159,6 +159,33 @@ def det_and_crops_from_output(output, frame, width, height):
 # ---------------------------------------------------------------------------
 # Detector: YOLOv11 (Ultralytics)
 # ---------------------------------------------------------------------------
+def _quiet_ultralytics_half_deprecation():
+    """Let Ultralytics' ``half`` deprecation WARNING through ONCE, then drop repeats.
+
+    Ultralytics logs "'half' is deprecated ... use 'quantize'" on every
+    ``predict`` call that passes ``half=`` — once per batch here, which floods the
+    log.  Half precision (``--fp16``) is intentional, so we keep passing it and
+    instead install a one-shot filter on the ``ultralytics`` logger: the notice
+    appears a single time, the repeats are suppressed.
+    """
+    import logging
+
+    class _HalfDeprecationOnce(logging.Filter):
+        seen = False
+
+        def filter(self, record):
+            msg = record.getMessage().lower()
+            if "half" in msg and "deprecated" in msg:
+                if _HalfDeprecationOnce.seen:
+                    return False
+                _HalfDeprecationOnce.seen = True
+            return True
+
+    ul_logger = logging.getLogger("ultralytics")
+    if not any(isinstance(f, _HalfDeprecationOnce) for f in ul_logger.filters):
+        ul_logger.addFilter(_HalfDeprecationOnce())
+
+
 class YOLOv11Detector:
     """Ultralytics YOLO adapter that emits YOLOX-shaped detection rows."""
 
@@ -172,6 +199,7 @@ class YOLOv11Detector:
             ) from exc
 
         self.model = YOLO(ckpt_path)
+        _quiet_ultralytics_half_deprecation()
         self.device = 0 if device_str == "gpu" else "cpu"
         self.half = bool(args.fp16 and device_str == "gpu")
         self.conf = args.conf
@@ -450,19 +478,22 @@ def run_stage1(detector, extractor, args, paths):
         if not window_frames:
             break
 
-        logger.info(
-            "Processing frames {}..{} ({:.2f} fps)".format(
-                frame_id,
-                frame_id + len(window_frames) - 1,
-                1.0 / max(1e-5, timer.average_time),
-            )
-        )
-
         timer.tic()
         # Producer — batched perception over the whole window.  No cross-frame
         # state; results come back in frame order, one (det, embs) per frame.
         window = perceive_batch(window_frames, detector, extractor, width, height)
         timer.toc()
+
+        # True frames/sec for the just-perceived batch: timer.diff covers the
+        # whole window, so divide by the frame count (NOT 1/avg, which would be
+        # batches/sec). Logged after toc so the first line shows a real rate.
+        logger.info(
+            "Processing frames {}..{} ({:.2f} fps)".format(
+                frame_id,
+                frame_id + len(window_frames) - 1,
+                len(window_frames) / max(1e-5, timer.diff),
+            )
+        )
 
         # Consumer — strict frame order; carries the tracker state.  frame_id is
         # advanced exactly once per frame so track_consume always sees strictly
