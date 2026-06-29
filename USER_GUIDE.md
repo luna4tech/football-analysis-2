@@ -21,14 +21,23 @@ Colab preinstalls most of this; a bare GPU VM does not. From scratch you need:
    ```bash
    nvidia-smi
    ```
-2. **Python 3 + a virtualenv:**
+2. **Python 3.10 or 3.11 + a virtualenv.** Use 3.10/3.11 — the versions this stack is
+   validated on (Colab runs ~3.10/3.11). Avoid 3.13: some pinned deps have no 3.13
+   wheels and fall back to (often failing) source builds. With conda:
    ```bash
-   python3 -m venv .venv && source .venv/bin/activate
+   conda create -n football python=3.11 -y && conda activate football
    ```
-3. **System libs for OpenCV** (commonly missing on headless Linux):
+   or a venv (needs the deadsnakes PPA if 3.11 isn't your system python):
    ```bash
-   sudo apt-get install -y libgl1 libglib2.0-0
+   python3.11 -m venv .venv && source .venv/bin/activate
    ```
+3. **System build tools + OpenCV libs** (commonly missing on a headless VM):
+   ```bash
+   sudo apt-get install -y build-essential python3-dev libgl1 libglib2.0-0
+   ```
+   `build-essential` + `python3-dev` compile the `reid` package's Cython extension in
+   step 5 (which installs with `--no-build-isolation`); `libgl1` / `libglib2.0-0` are
+   OpenCV's runtime libraries.
 4. **`torch` / `torchvision`** — Colab ships these; on a bare VM install a CUDA
    build yourself **before** step 5 (otherwise step 5 pulls a CPU-only torch).
    Check the CUDA version your driver supports — the top-right of `nvidia-smi`
