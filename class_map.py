@@ -13,12 +13,19 @@ The detector is resolved BY NAME (lowercased) via ``CLASS_NAME_TO_ID``; only the
 numeric values are owned here.
 """
 
+# The ONE source of truth: semantic class name -> id (GT scheme).
 CLASS_NAME_TO_ID = {"goalkeeper": 1, "player": 2, "referee": 3}
 UNKNOWN_CLASS = -1
-GOALKEEPER_CLASS = 1
-PLAYER_CLASS = 2
-REFEREE_CLASS = 3
+
+# Everything below is DERIVED from the map above — the numeric ids live in
+# exactly one place.
+GOALKEEPER_CLASS = CLASS_NAME_TO_ID["goalkeeper"]
+PLAYER_CLASS = CLASS_NAME_TO_ID["player"]
+REFEREE_CLASS = CLASS_NAME_TO_ID["referee"]
+
 CLASS_ID_TO_NAME = {v: k for k, v in CLASS_NAME_TO_ID.items()}
-# ordered for the eval confusion matrix (keep the existing row/col order: player, gk, ref)
+
+# Eval confusion-matrix order is deliberately (player, gk, ref) — NOT the map's
+# insertion order; names follow that order so the two can never drift.
 CLASS_LABELS = (PLAYER_CLASS, GOALKEEPER_CLASS, REFEREE_CLASS)
-CLASS_NAMES = ("player", "goalkeeper", "referee")
+CLASS_NAMES = tuple(CLASS_ID_TO_NAME[c] for c in CLASS_LABELS)
