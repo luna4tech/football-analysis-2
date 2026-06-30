@@ -27,10 +27,6 @@ Colab preinstalls most of this; a bare GPU VM does not. From scratch you need:
    ```bash
    conda create -n football python=3.11 -y && conda activate football
    ```
-   or a venv (needs the deadsnakes PPA if 3.11 isn't your system python):
-   ```bash
-   python3.11 -m venv .venv && source .venv/bin/activate
-   ```
 3. **System build tools + OpenCV libs** (commonly missing on a headless VM):
    ```bash
    sudo apt-get install -y build-essential python3-dev libgl1 libglib2.0-0
@@ -82,12 +78,12 @@ All commands below assume your shell's CWD is the **repo root**.
 ## A2. Minimal end-to-end run
 
 ```bash
-python -m pipeline run --video clip.mp4 --artifacts-dir ./out --fp16 --fuse
+python -m pipeline run --video video2780-2960.mp4 --artifacts-dir ./out --fp16 --fuse
 ```
 
 This chains Stage 1 (tracking) → Stage 2 (refine) → Stage 3 (team assignment),
 streaming each stage's live log, and writes a profiling summary. Everything for the
-clip lands under `./out/<video_stem>/` (full layout in §B2); the final result is
+clip lands under `./out/video2780-2960/` (full layout in §B2); the final result is
 `03_team/refined.txt` (refined MOT rows with a per-row `team_id`).
 
 ## A3. Key options
@@ -123,17 +119,65 @@ Then pull → run → push:
 
 ```bash
 # Pull the clip and the checkpoints from Blob
-python azure_blob.py download     videos clip.mp4 ./clip.mp4
-python azure_blob.py download-dir  checkpoints "" Deep-EIoU/Deep-EIoU/checkpoints
+python azure_blob.py download     inputs video2780-2960.mp4 ./testing/video2780-2960.mp4
+python azure_blob.py download-dir  models "" Deep-EIoU/Deep-EIoU/checkpoints
 
 # Run on local disk
-python -m pipeline run --video ./clip.mp4 --artifacts-dir ./out --device gpu --fp16 --fuse
+python -m pipeline run --video ./testing/video2780-2960.mp4 --artifacts-dir ./testing/out --device gpu --fp16 --fuse
 
 # Push the artifact tree back to Blob
-python azure_blob.py upload-dir    outputs <stem> ./out/<stem>
+python azure_blob.py upload-dir    outputs video2780-2960 ./testing/out/video2780-2960
 ```
 
-`az storage blob` / `azcopy` (via SAS, for very large transfers) remain alternatives.
+## A5. Verify outputs
+
+The pipeline outputs MOT `.txt`, not video. Rebuild a watchable overlay (CPU-only, no
+GPU). Frames are **0-based**, so do **not** pass `--one_indexed`:
+
+```bash
+REPO=$(pwd)                 # run from the repo root first
+cd Deep-EIoU/Deep-EIoU
+python tools/render_from_txt.py --path "$REPO/testing/video2780-2960.mp4" \
+    --txt "$REPO/testing/out/video2780-2960/03_team/refined.txt" \
+    --save_path "$REPO/testing/out/video2780-2960/video2780-2960_rendered.mp4"
+```
+
+## A6. Evaluate (HOTA / MOTA / IDF1 + class/team)
+
+Score the pipeline's `refined.txt` against ground truth. The evaluator is
+**standalone and CPU-only** (stdlib + numpy; no GPU or pipeline runtime) and reports
+**HOTA / DetA / AssA / MOTA / IDF1** via TrackEval, plus class/team attribute metrics.
+
+**Setup — TrackEval** (not pip-installed; clone it and pass its path):
+
+```bash
+git clone https://github.com/JonathonLuiten/TrackEval.git ./TrackEval
+# TrackEval still uses the removed np.float / np.int / np.bool aliases; on modern
+# numpy, patch them to the builtins once:
+grep -rl 'np\.float\|np\.int\|np\.bool' ./TrackEval/trackeval \
+  | xargs -r sed -i 's/np\.float\b/float/g; s/np\.int\b/int/g; s/np\.bool\b/bool/g'
+```
+
+**Run:**
+
+```bash
+python -m eval.evaluate \
+    --pred ./testing/out/video2780-2960/03_team/refined.txt \
+    --gt   ./testing/gt_mot_video2780-2960.txt \
+    --seq-name video2780-2960 \
+    --trackeval-path ./TrackEval \
+    --out  ./testing/out/video2780-2960/eval/metrics.json
+```
+
+- **GT format:** MOTChallenge `gt.txt` (**1-based** frames); the pipeline's **0-based**
+  output is converted automatically (`--gt-format` defaults to `motchallenge`).
+- **Class label:** TrackEval scores under `--class-name` (default `pedestrian`); override
+  only if your GT uses a different label.
+- **Outputs** (next to `--out`, i.e. `video2780-2960/eval/`):
+  - `metrics.json` — the 5 headline metrics + the full per-family dump (HOTA / CLEAR /
+    Identity / Count).
+  - `attributes_metrics.json` — class/team attribute accuracy. This step is **non-fatal**:
+    if it fails, the HOTA/MOTA results above still stand.
 
 
 # Part B — Reference
@@ -164,7 +208,8 @@ embeddings into two teams and writes the team label into the MOT output.
 
 ## B2. Artifact contract
 
-Everything for one video lives under `<artifacts-dir>/<video_stem>/`:
+Everything for one video lives under `<artifacts-dir>/<video_stem>/` (e.g.
+`./out/video2780-2960/`):
 
 ```
 <video_stem>/
@@ -194,35 +239,41 @@ on `refined_tracklets.pkl`. Force a recompute with `--force-*` (see §B5).
 
 To re-run just one stage (e.g. re-tune refinement without re-tracking), call the stage
 scripts directly. Each runs **in its own CWD** and takes the **same** `--video` /
-`--artifacts-dir` so they share the artifact tree.
+`--artifacts-dir` so they share the artifact tree. Capture the repo root once so the
+paths below stay **absolute** across the CWD changes:
+
+```bash
+REPO=$(pwd)        # run this from the repo root
+```
 
 **Stage 1 (tracking)** — CWD `Deep-EIoU/Deep-EIoU`:
 ```bash
-cd Deep-EIoU/Deep-EIoU
+cd "$REPO/Deep-EIoU/Deep-EIoU"
 python tools/stage1_track.py \
-    --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/out \
+    --video "$REPO/video2780-2960.mp4" \
+    --artifacts-dir "$REPO/out" \
     --device gpu --fp16
 ```
 
 **Stage 2 (refine)** — CWD `gta-link` (always runs split + connect):
 ```bash
-cd gta-link
+cd "$REPO/gta-link"
 python stage2_refine.py \
-    --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/out
+    --video "$REPO/video2780-2960.mp4" \
+    --artifacts-dir "$REPO/out"
 ```
 
 **Stage 3 (team)** — CWD-independent, but conventionally the repo root:
 ```bash
+cd "$REPO"
 python pipeline/team_assignment.py \
-    --video /abs/path/clip.mp4 \
-    --artifacts-dir /abs/path/out
+    --video "$REPO/video2780-2960.mp4" \
+    --artifacts-dir "$REPO/out"
 ```
 
-> Use **absolute** `--video` / `--artifacts-dir` here. Because each script runs in a
-> different CWD, a relative path resolves to a different place per stage. (The
-> orchestrator does this for you automatically.)
+> Use **absolute** `--video` / `--artifacts-dir` here (the `$REPO/...` form above is). A
+> relative path resolves to a different place per stage because each script runs in a
+> different CWD. (The orchestrator does this for you automatically.)
 
 Stages 2 and 3 use `--video` **only** to locate the artifact directory — they never read
 the video. Stage 2 reuses Stage 1's embeddings from `tracklets.pkl` (no ReID model);
@@ -272,10 +323,10 @@ Stage 1 also inherits DeepEIoU's `demo.py` tracker/detector knobs (`--conf`, `--
 By default each stage skips work when its output is newer than its inputs:
 
 ```bash
-python -m pipeline run --video clip.mp4 --force-all       # all stages
-python -m pipeline run --video clip.mp4 --force-stage1    # tracking only
-python -m pipeline run --video clip.mp4 --force-stage2    # refine only
-python -m pipeline run --video clip.mp4 --force-stage3    # team assignment only
+python -m pipeline run --video video2780-2960.mp4 --force-all       # all stages
+python -m pipeline run --video video2780-2960.mp4 --force-stage1    # tracking only
+python -m pipeline run --video video2780-2960.mp4 --force-stage2    # refine only
+python -m pipeline run --video video2780-2960.mp4 --force-stage3    # team assignment only
 ```
 
 (Directly: pass `--force` to `stage1_track.py` / `stage2_refine.py` / `team_assignment.py`.)
@@ -292,7 +343,7 @@ python -m pipeline run --video clip.mp4 --force-stage3    # team assignment only
 > - changed Stage-2 refine params → `--force-stage2` (or `--force-all`)
 >
 > ```bash
-> python -m pipeline run --video clip.mp4 --eps 0.5 --merge_dist_thres 0.35 --force-stage2
+> python -m pipeline run --video video2780-2960.mp4 --eps 0.5 --merge_dist_thres 0.35 --force-stage2
 > ```
 
 ## B6. Inspect profiling
@@ -312,9 +363,9 @@ Per-stage JSON fields:
 | `io` | caller metadata: frame counts, track counts, `emb_dim`, detector, refine params, team counts, … |
 
 ```bash
-cat /abs/path/out/<stem>/profiles/summary.md            # human-readable table
+cat ./out/video2780-2960/profiles/summary.md            # human-readable table
 python -c "import json,sys; print(json.load(open(sys.argv[1]))['totals'])" \
-    /abs/path/out/<stem>/profiles/summary.json          # totals (wall, gpu peak)
+    ./out/video2780-2960/profiles/summary.json          # totals (wall, gpu peak)
 ```
 
 `summary.md` has one row per stage plus a **TOTAL** row (summed wall time, max GPU peak).
@@ -325,86 +376,14 @@ Use the `io` block to inspect per-stage counts and the refine params used.
 Stage 1 detector inference is usually the bottleneck. Half-precision is the main lever:
 
 ```bash
-python -m pipeline run --video clip.mp4 --device gpu --fp16
-python -m pipeline run --video clip.mp4 --device gpu --fp16 --fuse   # + conv/BN fuse
+python -m pipeline run --video video2780-2960.mp4 --device gpu --fp16
+python -m pipeline run --video video2780-2960.mp4 --device gpu --fp16 --fuse   # + conv/BN fuse
 ```
 
 On a modern GPU (T4/A100) `--fp16` typically gives **~1.5–2× Stage-1 throughput** and
 roughly halves activation memory, with no meaningful accuracy change for inference.
 
-## B8. Verify outputs
-
-### Count tracks before vs after refinement
-
-Refinement should yield **fewer, cleaner** IDs (ID-switches split & re-merged):
-
-```bash
-cd Deep-EIoU/Deep-EIoU
-python tools/count_tracks.py /abs/path/out/<stem>/01_track/tracks.txt
-python tools/count_tracks.py /abs/path/out/<stem>/02_refine/refined.txt
-# ignore short-lived (noise) tracks:
-python tools/count_tracks.py /abs/path/out/<stem>/02_refine/refined.txt --min_len 5
-```
-
-Expect the `unique tracks` count on `refined.txt` to be **lower / cleaner** than on
-`tracks.txt`.
-
-### Eyeball the tracks (render an annotated video)
-
-The pipeline outputs MOT `.txt`, not video. Rebuild a watchable overlay (CPU-only, no
-GPU). Frames are **0-based**, so do **not** pass `--one_indexed`:
-
-```bash
-cd Deep-EIoU/Deep-EIoU
-python tools/render_from_txt.py --path /abs/path/clip.mp4 \
-    --txt /abs/path/out/<stem>/01_track/tracks.txt
-python tools/render_from_txt.py --path /abs/path/clip.mp4 \
-    --txt /abs/path/out/<stem>/03_team/refined.txt
-```
-
-Each writes `<txt>_rendered.mp4` next to the `.txt` (or pass `--save_path`).
-
-## B9. Evaluate (HOTA / MOTA / IDF1 + class/team)
-
-Score the pipeline's `refined.txt` against ground truth. The evaluator is
-**standalone and CPU-only** (stdlib + numpy; no GPU or pipeline runtime) and reports
-**HOTA / DetA / AssA / MOTA / IDF1** via TrackEval, plus class/team attribute metrics.
-
-**Setup — TrackEval** (not pip-installed; clone it and pass its path):
-
-```bash
-git clone https://github.com/JonathonLuiten/TrackEval.git /path/to/TrackEval
-# TrackEval still uses the removed np.float / np.int / np.bool aliases; on modern
-# numpy, patch them to the builtins once:
-grep -rl 'np\.float\|np\.int\|np\.bool' /path/to/TrackEval/trackeval \
-  | xargs -r sed -i 's/np\.float\b/float/g; s/np\.int\b/int/g; s/np\.bool\b/bool/g'
-```
-
-**Run:**
-
-```bash
-python -m eval.evaluate \
-    --pred /abs/path/out/<stem>/03_team/refined.txt \
-    --gt   /abs/path/gt_mot_<stem>.txt \
-    --seq-name <stem> \
-    --trackeval-path /path/to/TrackEval \
-    --out  /abs/path/out/<stem>/eval/metrics.json
-```
-
-Or pass `--video clip.mp4` (with `--artifacts-dir`) instead of `--pred` to auto-locate
-`refined.txt` (prefers `03_team/`, falls back to `02_refine/`).
-
-- **GT format:** MOTChallenge `gt.txt` (**1-based** frames); the pipeline's **0-based**
-  output is converted automatically (`--gt-format` defaults to `motchallenge`).
-- **Class label:** TrackEval scores under `--class-name` (default `pedestrian`); override
-  only if your GT uses a different label.
-- **Outputs** (next to `--out`, i.e. `<stem>/eval/`):
-  - `metrics.json` — the 5 headline metrics + the full per-family dump (HOTA / CLEAR /
-    Identity / Count).
-  - `attributes_metrics.json` — class/team attribute accuracy. This step is **non-fatal**:
-    if it fails, the HOTA/MOTA results above still stand.
-
-## B10. Dependency rationale & troubleshooting
+## B8. Dependency rationale & troubleshooting
 
 **Why these deps.** `gta-link/requirements.txt` is the comprehensive set because it
 covers both Stage 2's refine libraries and the import-time deps of the vendored torchreid
@@ -425,7 +404,7 @@ packages (`tb-nightly`, `flake8`, `yapf`) the pipeline doesn't use — harmless,
 - **`FileNotFoundError` for a checkpoint** — `yolov11l.pt` and `sports_model.pth.tar-60`
   must sit in `Deep-EIoU/Deep-EIoU/checkpoints/` under those exact names (§A1).
 - **Writing artifacts is slow / flaky on long videos** (`tracklets.pkl` can be hundreds
-  of MB) — write to fast local disk (`--artifacts-dir /local/work`), then sync to your
+  of MB) — write to fast local disk (`--artifacts-dir ./out`), then sync to your
   network/Blob store afterwards (§A4).
 - **Re-tuning a parameter seems ignored** — that's the cache; add the matching `--force-*`
   flag (§B5).

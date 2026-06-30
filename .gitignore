@@ -38,3 +38,4 @@ Thumbs.db
 # Local sample data (videos + GT), never committed
 test-data/
 output-colab/
+testing/
